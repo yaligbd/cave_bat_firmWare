@@ -136,7 +136,12 @@ void appMain(void) {
        is_flying = false; 
     }
 
-    if ((tele_alive % 10) == 0) {
+    // Every 10s, not every 1s. The loop runs at 10Hz, so "% 10" printed a
+    // ~60-char status line every second. Over BLE that saturates the link and
+    // queues real replies (param/log TOC) behind console text until the app
+    // times out waiting for them. This is a heartbeat, not telemetry - the
+    // app reads tele.* directly.
+    if ((tele_alive % 100) == 0) {
       DEBUG_PRINT("CB state=%d bat=%d f=%d b=%d l=%d r=%d u=%d d=%d\n",
                   (int)mission_state, (int)tele_vbat, (int)tele_front,
                   (int)tele_back, (int)tele_left, (int)tele_right,

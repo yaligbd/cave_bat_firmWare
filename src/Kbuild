@@ -1,0 +1,4 @@
+# Only cavebat.o. cavebat_v2.c is deliberately NOT built — it defines its own
+# appMain() and would collide. Swap the two lines to build v2 instead.
+obj-y += cavebat.o
+# obj-y += cavebat_v2.o

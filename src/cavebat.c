@@ -7,7 +7,7 @@
 #include "param.h"
 #include "log.h"
 #include "commander.h" 
-#include "high_level_commander.h"
+#include "crtp_commander_high_level.h"
 #include "stabilizer_types.h"
 
 #define DEBUG_MODULE "CAVEBAT"
@@ -56,7 +56,7 @@ void appMain(void) {
   uint32_t flight_start_time = 0;
   bool is_flying = false;
 
-  highLevelCommanderInit();
+  crtpCommanderHighLevelInit();
 
   while (1) {
     // 1. Update Telemetry
@@ -83,7 +83,7 @@ void appMain(void) {
         float takeoff_duration = target_height_m / 0.3f; // safe velocity 0.3 m/s
         if (takeoff_duration < 1.0f) takeoff_duration = 1.0f;
         
-        highLevelCommanderTakeoff(target_height_m, takeoff_duration);
+        crtpCommanderHighLevelTakeoff(target_height_m, takeoff_duration);
         
     } else if (mission_state == 1 && is_flying) {
         // App is in Fly mode -> Check Timer
@@ -97,7 +97,7 @@ void appMain(void) {
             float land_duration = target_height_m / 0.3f;
             if (land_duration < 1.0f) land_duration = 1.0f;
             
-            highLevelCommanderLand(0.0f, land_duration);
+            crtpCommanderHighLevelLand(0.0f, land_duration);
             vTaskDelay(M2T((uint32_t)(land_duration * 1000) + 500));
             
             mission_state = 0; // Reset to idle
@@ -124,7 +124,7 @@ void appMain(void) {
         float land_duration = target_height_m / 0.3f;
         if (land_duration < 1.0f) land_duration = 1.0f;
         
-        highLevelCommanderLand(0.0f, land_duration);
+        crtpCommanderHighLevelLand(0.0f, land_duration);
         vTaskDelay(M2T((uint32_t)(land_duration * 1000) + 500));
         
         mission_state = 0; // Reset to idle

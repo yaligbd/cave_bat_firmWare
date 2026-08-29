@@ -80,6 +80,13 @@ static uint8_t  tele_clear = 0;
 // back on.
 static uint8_t  mission_guards = 0;
 
+// Highest point reached during the last flight, in mm, and why that flight
+// ended. Published so a flight can be judged from the app alone -- no radio
+// script, no second link. The drone reports on itself.
+//   0 = never flown   1 = timer completed   2 = aborted
+static uint16_t tele_maxz   = 0;
+static uint8_t  tele_endwhy = 0;
+
 // 0 means "no reading" (out of range) and must NOT count as an obstacle,
 // otherwise open space would read as blocked.
 static bool sideBlocked(uint16_t mm) {
@@ -176,6 +183,8 @@ void appMain(void) {
         // AND the requested hover time has elapsed on top of it.
         obstacle_streak = 0;
         lowbat_streak = 0;
+        tele_maxz = 0;
+        tele_endwhy = 0;
         climb_done_tick = xTaskGetTickCount()
                         + M2T((uint32_t)(takeoff_duration * 1000.0f));
         hover_deadline = xTaskGetTickCount()
@@ -183,9 +192,14 @@ void appMain(void) {
                        + M2T(mission_timer * 1000);
         
     } else if (mission_state == 1 && is_flying) {
+        // Peak altitude, so the flight can be judged after the fact.
+        if (tele_z > 0 && (uint16_t)tele_z > tele_maxz) tele_maxz = (uint16_t)tele_z;
+
         // App is in Fly mode -> Check Timer
         if ((int32_t)(xTaskGetTickCount() - hover_deadline) >= 0) {
-            DEBUG_PRINT("CAVEBAT: Timer complete. Landing.\n");
+            tele_endwhy = 1;
+            DEBUG_PRINT("CAVEBAT: FLIGHT OK, timer done, peak %d mm of %d mm asked\n",
+                        (int)tele_maxz, (int)mission_height);
             
             float target_height_m = mission_height / 1000.0f;
             float land_duration = target_height_m / 0.3f;
@@ -252,7 +266,9 @@ void appMain(void) {
 
     } else if (mission_state == 2) {
         // App requested Abort
-        DEBUG_PRINT("CAVEBAT: Mission Aborted! Landing immediately.\n");
+        tele_endwhy = 2;
+        DEBUG_PRINT("CAVEBAT: FLIGHT ABORTED, peak %d mm of %d mm asked\n",
+                    (int)tele_maxz, (int)mission_height);
         
         float target_height_m = mission_height / 1000.0f;
         float land_duration = target_height_m / 0.3f;
@@ -292,6 +308,8 @@ PARAM_GROUP_START(tele)
   PARAM_ADD(PARAM_UINT16, alive, &tele_alive)
   PARAM_ADD(PARAM_UINT8,  canfly, &tele_canfly)
   PARAM_ADD(PARAM_UINT8,  clear,  &tele_clear)
+  PARAM_ADD(PARAM_UINT16, maxz,   &tele_maxz)
+  PARAM_ADD(PARAM_UINT8,  endwhy, &tele_endwhy)
   PARAM_ADD(PARAM_UINT16, vbat,  &tele_vbat)
   PARAM_ADD(PARAM_UINT16, front, &tele_front)
   PARAM_ADD(PARAM_UINT16, back,  &tele_back)
@@ -319,6 +337,8 @@ LOG_GROUP_START(tele)
   LOG_ADD(LOG_UINT16, alive, &tele_alive)
   LOG_ADD(LOG_UINT8,  canfly, &tele_canfly)
   LOG_ADD(LOG_UINT8,  clear,  &tele_clear)
+  LOG_ADD(LOG_UINT16, maxz,   &tele_maxz)
+  LOG_ADD(LOG_UINT8,  endwhy, &tele_endwhy)
   LOG_ADD(LOG_UINT16, vbat,  &tele_vbat)
   LOG_ADD(LOG_UINT16, front, &tele_front)
   LOG_ADD(LOG_UINT16, back,  &tele_back)

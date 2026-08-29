@@ -68,6 +68,7 @@ void appMain(void) {
   DEBUG_PRINT("CAVEBAT: Flight & Telemetry starting\n");
   
   uint32_t flight_start_time = 0;
+  uint32_t hover_deadline = 0;  // tick at which a hovering flight should land
   bool is_flying = false;
 
   crtpCommanderHighLevelInit();
@@ -107,13 +108,19 @@ void appMain(void) {
         if (takeoff_duration < 1.0f) takeoff_duration = 1.0f;
         
         crtpCommanderHighLevelTakeoff(target_height_m, takeoff_duration);
+
+        // The timer is meant to be HOVER time. Counting it from the moment the
+        // climb starts meant a short timer expired mid-climb: a 1s mission
+        // began descending before it ever reached altitude, which looked like
+        // "it never got off the ground". Land only once the climb has finished
+        // AND the requested hover time has elapsed on top of it.
+        hover_deadline = xTaskGetTickCount()
+                       + M2T((uint32_t)(takeoff_duration * 1000.0f))
+                       + M2T(mission_timer * 1000);
         
     } else if (mission_state == 1 && is_flying) {
         // App is in Fly mode -> Check Timer
-        uint32_t current_time = xTaskGetTickCount();
-        uint32_t elapsed_sec = (current_time - flight_start_time) / configTICK_RATE_HZ;
-        
-        if (elapsed_sec >= mission_timer) {
+        if ((int32_t)(xTaskGetTickCount() - hover_deadline) >= 0) {
             DEBUG_PRINT("CAVEBAT: Timer complete. Landing.\n");
             
             float target_height_m = mission_height / 1000.0f;
@@ -148,6 +155,13 @@ void appMain(void) {
             }
         }
         
+    } else if (mission_state == 2 && !is_flying) {
+        // Abort pressed while already on the ground. Commanding a landing here
+        // ran a full land trajectory from zero height, spinning the motors for
+        // over a second for no reason. Just clear the request.
+        DEBUG_PRINT("CAVEBAT: Abort ignored, not flying\n");
+        mission_state = 0;
+
     } else if (mission_state == 2) {
         // App requested Abort
         DEBUG_PRINT("CAVEBAT: Mission Aborted! Landing immediately.\n");

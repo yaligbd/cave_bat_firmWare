@@ -87,6 +87,12 @@ void appMain(void) {
   uint32_t flight_start_time = 0;
   uint32_t hover_deadline = 0;  // tick at which a hovering flight should land
   uint8_t  obstacle_streak = 0; // consecutive cycles seeing an obstacle
+  // Tick at which the climb finishes. Obstacle checking is suppressed until
+  // then: while climbing, the drone tilts and the side-facing rangers catch
+  // the floor, producing readings well under the limit with nothing actually
+  // in the way. Measured in flight: sides flicked between 32766 ("nothing")
+  // and ~450mm during a climb that was steady at 400-800mm at rest.
+  uint32_t climb_done_tick = 0;
   bool is_flying = false;
 
   crtpCommanderHighLevelInit();
@@ -145,6 +151,8 @@ void appMain(void) {
         // "it never got off the ground". Land only once the climb has finished
         // AND the requested hover time has elapsed on top of it.
         obstacle_streak = 0;
+        climb_done_tick = xTaskGetTickCount()
+                        + M2T((uint32_t)(takeoff_duration * 1000.0f));
         hover_deadline = xTaskGetTickCount()
                        + M2T((uint32_t)(takeoff_duration * 1000.0f))
                        + M2T(mission_timer * 1000);
@@ -177,11 +185,14 @@ void appMain(void) {
             }
 
             // Abort if an obstacle gets closer than 200mm (0 means no reading)
-            // Require the obstacle to persist. A single stray short reading
-            // from a ToF sensor should not end a flight; three in a row at
-            // 10Hz is 0.3s, still fast enough to be useful.
-            if (sideBlocked(tele_front) || sideBlocked(tele_back) ||
-                sideBlocked(tele_left)  || sideBlocked(tele_right)) {
+            // Only once the climb is done -- see climb_done_tick. Requiring the
+            // obstacle to persist as well: a single stray short reading from a
+            // ToF sensor should not end a flight, but three in a row at 10Hz is
+            // 0.3s, still fast enough to be useful.
+            if ((int32_t)(xTaskGetTickCount() - climb_done_tick) < 0) {
+                obstacle_streak = 0;
+            } else if (sideBlocked(tele_front) || sideBlocked(tele_back) ||
+                       sideBlocked(tele_left)  || sideBlocked(tele_right)) {
                 obstacle_streak++;
             } else {
                 obstacle_streak = 0;

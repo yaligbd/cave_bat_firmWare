@@ -1,4 +1,10 @@
-# Only cavebat.o. cavebat_v2.c is deliberately NOT built — it defines its own
-# appMain() and would collide. Swap the two lines to build v2 instead.
-obj-y += cavebat.o
-# obj-y += cavebat_v2.o
+# Building cavebat_v2: the autonomous survey flight (wall following, recorded
+# waypoints, retrace on the way back, download over CRTP port 14).
+#
+# cavebat.c is the previous single-hover firmware. It is kept in the tree
+# because it is the last version verified flying end to end (tag
+# v2-full-mission), but it must NOT be built at the same time -- both define
+# appMain() and the link would fail. Swap the two obj-y lines to go back.
+obj-y += cavebat_v2.o
+obj-y += wallfollowing_multiranger_onboard.o
+# obj-y += cavebat.o

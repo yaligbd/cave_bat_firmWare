@@ -1,3 +1,5 @@
 CONFIG_APP_ENABLE=y
 CONFIG_APP_PRIORITY=1
-CONFIG_APP_STACKSIZE=350
+# 350 is the Bitcraze default. Raised because cavebat_v2 runs the wall-follower
+# state machine plus float maths inside the same app task.
+CONFIG_APP_STACKSIZE=500

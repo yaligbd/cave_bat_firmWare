@@ -46,6 +46,23 @@ static uint32_t mission_minvbat = 3700;   // mV, resting threshold, tunable
 // show it, instead of letting a doomed flight start and look like a bug.
 static uint8_t  tele_canfly = 0;
 
+// --- Obstacle Safety ---
+// Side clearance below which flight is refused/aborted, in mm. Tunable,
+// because 200mm is easy to trip indoors: a desk edge, a chair, or the pilot
+// standing nearby all sit inside it.
+static uint32_t mission_minobst = 200;
+
+// 1 = clear to take off, 0 = something is inside mission_minobst. Published so
+// the app can say WHY it will not fly, instead of the drone hopping a few
+// centimetres and landing, which reads as a broken controller.
+static uint8_t  tele_clear = 0;
+
+// 0 means "no reading" (out of range) and must NOT count as an obstacle,
+// otherwise open space would read as blocked.
+static bool sideBlocked(uint16_t mm) {
+  return (mm > 0) && (mm < (uint16_t)mission_minobst);
+}
+
 static uint16_t clampRange(float mm) {
   if (mm <= 0.0f || mm > 3000.0f) return 0;
   return (uint16_t)mm;
@@ -69,6 +86,7 @@ void appMain(void) {
   
   uint32_t flight_start_time = 0;
   uint32_t hover_deadline = 0;  // tick at which a hovering flight should land
+  uint8_t  obstacle_streak = 0; // consecutive cycles seeing an obstacle
   bool is_flying = false;
 
   crtpCommanderHighLevelInit();
@@ -78,6 +96,8 @@ void appMain(void) {
     tele_alive++;
     tele_vbat  = (uint16_t)(logGetFloat(idVbat) * 1000.0f);
     tele_canfly = (tele_vbat >= mission_minvbat) ? 1 : 0;
+    tele_clear = (sideBlocked(tele_front) || sideBlocked(tele_back) ||
+                  sideBlocked(tele_left)  || sideBlocked(tele_right)) ? 0 : 1;
     tele_front = clampRange(logGetFloat(idFront));
     tele_back  = clampRange(logGetFloat(idBack));
     tele_left  = clampRange(logGetFloat(idLeft));
@@ -95,6 +115,16 @@ void appMain(void) {
         DEBUG_PRINT("CAVEBAT: Takeoff REFUSED, battery %d mV < %d mV min\n",
                     (int)tele_vbat, (int)mission_minvbat);
         mission_state = 0; // clear the request so the app sees it rejected
+
+    } else if (mission_state == 1 && !is_flying && !tele_clear) {
+        // Something is already inside the clearance limit. Taking off here just
+        // trips the in-flight abort ~100ms later, so the drone hops a few
+        // centimetres and lands -- which looks like a broken controller rather
+        // than an obstacle. Refuse up front and say so.
+        DEBUG_PRINT("CAVEBAT: Takeoff REFUSED, obstacle within %d mm (f=%d b=%d l=%d r=%d)\n",
+                    (int)mission_minobst, (int)tele_front, (int)tele_back,
+                    (int)tele_left, (int)tele_right);
+        mission_state = 0;
 
     } else if (mission_state == 1 && !is_flying) {
         // App requested Takeoff
@@ -114,6 +144,7 @@ void appMain(void) {
         // began descending before it ever reached altitude, which looked like
         // "it never got off the ground". Land only once the climb has finished
         // AND the requested hover time has elapsed on top of it.
+        obstacle_streak = 0;
         hover_deadline = xTaskGetTickCount()
                        + M2T((uint32_t)(takeoff_duration * 1000.0f))
                        + M2T(mission_timer * 1000);
@@ -146,11 +177,19 @@ void appMain(void) {
             }
 
             // Abort if an obstacle gets closer than 200mm (0 means no reading)
-            if ((tele_front > 0 && tele_front < 200) ||
-                (tele_back  > 0 && tele_back  < 200) ||
-                (tele_left  > 0 && tele_left  < 200) ||
-                (tele_right > 0 && tele_right < 200)) {
-                DEBUG_PRINT("CAVEBAT: Obstacle detected < 200mm! Aborting.\n");
+            // Require the obstacle to persist. A single stray short reading
+            // from a ToF sensor should not end a flight; three in a row at
+            // 10Hz is 0.3s, still fast enough to be useful.
+            if (sideBlocked(tele_front) || sideBlocked(tele_back) ||
+                sideBlocked(tele_left)  || sideBlocked(tele_right)) {
+                obstacle_streak++;
+            } else {
+                obstacle_streak = 0;
+            }
+            if (obstacle_streak >= 3) {
+                DEBUG_PRINT("CAVEBAT: Obstacle within %d mm (f=%d b=%d l=%d r=%d), aborting\n",
+                            (int)mission_minobst, (int)tele_front, (int)tele_back,
+                            (int)tele_left, (int)tele_right);
                 mission_state = 2; // Trigger Abort
             }
         }
@@ -203,6 +242,7 @@ void appMain(void) {
 PARAM_GROUP_START(tele)
   PARAM_ADD(PARAM_UINT16, alive, &tele_alive)
   PARAM_ADD(PARAM_UINT8,  canfly, &tele_canfly)
+  PARAM_ADD(PARAM_UINT8,  clear,  &tele_clear)
   PARAM_ADD(PARAM_UINT16, vbat,  &tele_vbat)
   PARAM_ADD(PARAM_UINT16, front, &tele_front)
   PARAM_ADD(PARAM_UINT16, back,  &tele_back)
@@ -221,12 +261,14 @@ PARAM_GROUP_START(mission)
   PARAM_ADD(PARAM_UINT32, height,     &mission_height)
   PARAM_ADD(PARAM_UINT32, sampledist, &mission_sampledist)
   PARAM_ADD(PARAM_UINT32, minvbat,    &mission_minvbat)
+  PARAM_ADD(PARAM_UINT32, minobst,    &mission_minobst)
 PARAM_GROUP_STOP(mission)
 
 // --- Log Registration ---
 LOG_GROUP_START(tele)
   LOG_ADD(LOG_UINT16, alive, &tele_alive)
   LOG_ADD(LOG_UINT8,  canfly, &tele_canfly)
+  LOG_ADD(LOG_UINT8,  clear,  &tele_clear)
   LOG_ADD(LOG_UINT16, vbat,  &tele_vbat)
   LOG_ADD(LOG_UINT16, front, &tele_front)
   LOG_ADD(LOG_UINT16, back,  &tele_back)

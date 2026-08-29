@@ -40,7 +40,13 @@ static uint32_t mission_sampledist = 10; // cm
 static uint32_t mission_minvbat = 3700;   // mV, resting threshold, tunable
 // Voltage sags hard under motor load, so the in-flight cutoff must sit below
 // the resting threshold or every flight would abort the instant it lifted.
-#define VBAT_INFLIGHT_MARGIN_MV 300
+//
+// 300mV was measured to be far too tight: a flight starting at 3890mV sagged
+// to 3383mV during the takeoff climb and tripped a 3400mV cutoff, ending the
+// mission at 2cm. Spin-up is the worst moment for sag, so the margin is now
+// 600mV AND the check is suppressed until the climb is done. 3700-600 = 3100mV
+// still sits above the ~3.0V where a Crazyflie cell is genuinely empty.
+#define VBAT_INFLIGHT_MARGIN_MV 600
 
 // 1 = healthy enough to attempt takeoff, 0 = too low. Published so the app can
 // show it, instead of letting a doomed flight start and look like a bug.
@@ -87,6 +93,7 @@ void appMain(void) {
   uint32_t flight_start_time = 0;
   uint32_t hover_deadline = 0;  // tick at which a hovering flight should land
   uint8_t  obstacle_streak = 0; // consecutive cycles seeing an obstacle
+  uint8_t  lowbat_streak = 0;   // consecutive cycles seeing a collapsed battery
   // Tick at which the climb finishes. Obstacle checking is suppressed until
   // then: while climbing, the drone tilts and the side-facing rangers catch
   // the floor, producing readings well under the limit with nothing actually
@@ -151,6 +158,7 @@ void appMain(void) {
         // "it never got off the ground". Land only once the climb has finished
         // AND the requested hover time has elapsed on top of it.
         obstacle_streak = 0;
+        lowbat_streak = 0;
         climb_done_tick = xTaskGetTickCount()
                         + M2T((uint32_t)(takeoff_duration * 1000.0f));
         hover_deadline = xTaskGetTickCount()
@@ -176,9 +184,18 @@ void appMain(void) {
             // after the takeoff trajectory is complete. No explicit API call needed.
             
             // Abort if the battery collapses mid-flight. A controlled landing
-            // beats the supervisor cutting the motors at altitude.
-            if (tele_vbat > 0 &&
-                tele_vbat < (mission_minvbat - VBAT_INFLIGHT_MARGIN_MV)) {
+            // beats the supervisor cutting the motors at altitude. Skipped
+            // during the climb, where spin-up sag is worst, and requires the
+            // reading to persist so one dip cannot end a flight.
+            if ((int32_t)(xTaskGetTickCount() - climb_done_tick) < 0) {
+                lowbat_streak = 0;
+            } else if (tele_vbat > 0 &&
+                       tele_vbat < (mission_minvbat - VBAT_INFLIGHT_MARGIN_MV)) {
+                lowbat_streak++;
+            } else {
+                lowbat_streak = 0;
+            }
+            if (lowbat_streak >= 3) {
                 DEBUG_PRINT("CAVEBAT: Battery %d mV collapsed in flight, landing\n",
                             (int)tele_vbat);
                 mission_state = 2; // Trigger Abort

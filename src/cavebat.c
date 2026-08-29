@@ -32,6 +32,20 @@ static uint32_t mission_timer = 10; // Seconds to hover
 static uint32_t mission_height = 500; // Hover altitude in mm
 static uint32_t mission_sampledist = 10; // cm
 
+// --- Battery Safety ---
+// Resting voltage below which takeoff is refused outright. A Crazyflie 2.x
+// LiPo is ~4.2V full and ~3.0V empty; below roughly 3.7V at rest it no longer
+// has the headroom to climb. That failure looks like "took off, never reached
+// altitude, came down early" rather than like a flat battery.
+static uint32_t mission_minvbat = 3700;   // mV, resting threshold, tunable
+// Voltage sags hard under motor load, so the in-flight cutoff must sit below
+// the resting threshold or every flight would abort the instant it lifted.
+#define VBAT_INFLIGHT_MARGIN_MV 300
+
+// 1 = healthy enough to attempt takeoff, 0 = too low. Published so the app can
+// show it, instead of letting a doomed flight start and look like a bug.
+static uint8_t  tele_canfly = 0;
+
 static uint16_t clampRange(float mm) {
   if (mm <= 0.0f || mm > 3000.0f) return 0;
   return (uint16_t)mm;
@@ -62,6 +76,7 @@ void appMain(void) {
     // 1. Update Telemetry
     tele_alive++;
     tele_vbat  = (uint16_t)(logGetFloat(idVbat) * 1000.0f);
+    tele_canfly = (tele_vbat >= mission_minvbat) ? 1 : 0;
     tele_front = clampRange(logGetFloat(idFront));
     tele_back  = clampRange(logGetFloat(idBack));
     tele_left  = clampRange(logGetFloat(idLeft));
@@ -73,9 +88,17 @@ void appMain(void) {
     tele_z     = (int16_t)(logGetFloat(idZ) * 1000.0f);
 
     // 2. Flight State Machine
-    if (mission_state == 1 && !is_flying) {
+    if (mission_state == 1 && !is_flying && !tele_canfly) {
+        // Too low to climb. Refuse rather than half-fly: an underpowered
+        // takeoff looks like a software fault but is really a flat battery.
+        DEBUG_PRINT("CAVEBAT: Takeoff REFUSED, battery %d mV < %d mV min\n",
+                    (int)tele_vbat, (int)mission_minvbat);
+        mission_state = 0; // clear the request so the app sees it rejected
+
+    } else if (mission_state == 1 && !is_flying) {
         // App requested Takeoff
-        DEBUG_PRINT("CAVEBAT: Initiating Takeoff to %d mm\n", (int)mission_height);
+        DEBUG_PRINT("CAVEBAT: Initiating Takeoff to %d mm, battery %d mV\n",
+                    (int)mission_height, (int)tele_vbat);
         flight_start_time = xTaskGetTickCount();
         is_flying = true;
         
@@ -106,6 +129,15 @@ void appMain(void) {
             // High-level commander automatically maintains position (hovers)
             // after the takeoff trajectory is complete. No explicit API call needed.
             
+            // Abort if the battery collapses mid-flight. A controlled landing
+            // beats the supervisor cutting the motors at altitude.
+            if (tele_vbat > 0 &&
+                tele_vbat < (mission_minvbat - VBAT_INFLIGHT_MARGIN_MV)) {
+                DEBUG_PRINT("CAVEBAT: Battery %d mV collapsed in flight, landing\n",
+                            (int)tele_vbat);
+                mission_state = 2; // Trigger Abort
+            }
+
             // Abort if an obstacle gets closer than 200mm (0 means no reading)
             if ((tele_front > 0 && tele_front < 200) ||
                 (tele_back  > 0 && tele_back  < 200) ||
@@ -156,6 +188,7 @@ void appMain(void) {
 // --- Parameter Registration ---
 PARAM_GROUP_START(tele)
   PARAM_ADD(PARAM_UINT16, alive, &tele_alive)
+  PARAM_ADD(PARAM_UINT8,  canfly, &tele_canfly)
   PARAM_ADD(PARAM_UINT16, vbat,  &tele_vbat)
   PARAM_ADD(PARAM_UINT16, front, &tele_front)
   PARAM_ADD(PARAM_UINT16, back,  &tele_back)
@@ -173,11 +206,13 @@ PARAM_GROUP_START(mission)
   PARAM_ADD(PARAM_UINT32, timer,      &mission_timer)
   PARAM_ADD(PARAM_UINT32, height,     &mission_height)
   PARAM_ADD(PARAM_UINT32, sampledist, &mission_sampledist)
+  PARAM_ADD(PARAM_UINT32, minvbat,    &mission_minvbat)
 PARAM_GROUP_STOP(mission)
 
 // --- Log Registration ---
 LOG_GROUP_START(tele)
   LOG_ADD(LOG_UINT16, alive, &tele_alive)
+  LOG_ADD(LOG_UINT8,  canfly, &tele_canfly)
   LOG_ADD(LOG_UINT16, vbat,  &tele_vbat)
   LOG_ADD(LOG_UINT16, front, &tele_front)
   LOG_ADD(LOG_UINT16, back,  &tele_back)

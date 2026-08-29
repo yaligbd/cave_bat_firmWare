@@ -42,6 +42,8 @@
 #include "crtp.h"
 #include "usec_time.h"
 
+#include "supervisor.h"
+
 #include "wallfollowing_multiranger_onboard.h"
 
 #define DEBUG_MODULE "CAVEBAT"
@@ -90,6 +92,14 @@ static uint32_t mission_timer  = 30;    // seconds, whole flight, out and back
 static uint32_t mission_height = 500;   // mm
 static uint32_t mission_walldist = 400; // mm to hold from a wall
 static uint8_t  mission_goleft = 1;     // 1 = wall on the left, 0 = right
+// 0 = hold position during the outbound leg, 1 = follow walls.
+//
+// Defaults to OFF. The first v2 flight crashed during takeoff, and with wall
+// following enabled there is no way to tell whether the fault is in the
+// takeoff, the handover between the two commanders, or the wall follower. With
+// it off the flight is takeoff -> hold -> retrace -> land: the same shape as
+// the real mission with one fewer thing that can be wrong.
+static uint8_t  mission_wallfollow = 0;
 
 // --- Telemetry, readable by the app ---------------------------------------
 static uint16_t tele_alive  = 0;
@@ -105,6 +115,9 @@ static int16_t  tele_y      = 0;
 static int16_t  tele_z      = 0;
 static uint16_t tele_samples = 0;   // how many samples are stored
 static uint8_t  tele_phase   = 0;   // see Phase below
+// Bit 0 crashed, bit 1 tumbled, bit 2 can fly, bit 3 is flying. The drone's own
+// verdict on itself, so a bad flight can be read back rather than guessed at.
+static uint8_t  tele_sup     = 0;
 
 typedef enum {
   PHASE_IDLE     = 0,
@@ -253,6 +266,25 @@ void appMain(void) {
     tele_y     = (int16_t)(logGetFloat(idY) * 1000.0f);
     tele_z     = (int16_t)(logGetFloat(idZ) * 1000.0f);
     tele_phase = (uint8_t)phase;
+    tele_sup = (supervisorIsCrashed() ? 1 : 0)
+             | (supervisorIsTumbled() ? 2 : 0)
+             | (supervisorCanFly()    ? 4 : 0)
+             | (supervisorIsFlying()  ? 8 : 0);
+
+    // The supervisor's verdict overrides this state machine. Without this the
+    // mission carried on regardless: the first v2 flight logged "Crashed,
+    // recovery required" during takeoff, then flew the outbound leg, turned
+    // around and recorded six samples while lying on the floor.
+    if ((phase == PHASE_TAKEOFF || phase == PHASE_OUTBOUND ||
+         phase == PHASE_RETURN  || phase == PHASE_LANDING) &&
+        (supervisorIsCrashed() || supervisorIsTumbled())) {
+      DEBUG_PRINT("CAVEBAT: CRASH in phase %d, stopping. %d samples kept\n",
+                  (int)phase, (int)sample_count);
+      crtpCommanderHighLevelStop();
+      phase = PHASE_READY;
+      mission_state = 3;
+      continue;
+    }
 
     // --- download requests, safe in any phase ----------------------------
     if (clear_requested) {
@@ -310,8 +342,11 @@ void appMain(void) {
       bool at_height = (z > target_height_m - 0.1f);
       bool timed_out = ((now - phase_started) > M2T(6000));
       if (at_height || timed_out) {
-        DEBUG_PRINT("CAVEBAT: outbound, wall on the %s\n",
-                    mission_goleft ? "left" : "right");
+        DEBUG_PRINT("CAVEBAT: outbound, %s\n",
+                    mission_wallfollow
+                      ? (mission_goleft ? "following wall on the left"
+                                        : "following wall on the right")
+                      : "holding position (wall following off)");
         phase = PHASE_OUTBOUND;
         phase_started = now;
       }
@@ -319,6 +354,22 @@ void appMain(void) {
     }
 
     case PHASE_OUTBOUND: {
+      if (!mission_wallfollow) {
+        // Hold station. Zero velocity still has to be sent every cycle: once we
+        // have taken over from the high-level commander, our setpoint is what
+        // keeps the supervisor's watchdog fed.
+        setWorldVelocity(&setpoint, 0.0f, 0.0f, target_height_m);
+        commanderSetSetpoint(&setpoint, 3);
+        if ((now - phase_started) > M2T(outbound_ms)) {
+          DEBUG_PRINT("CAVEBAT: turning back, %d samples out\n", (int)sample_count);
+          phase = PHASE_RETURN;
+          phase_started = now;
+          return_index = (int16_t)sample_count - 2;
+          waypoint_started = now;
+        }
+        break;
+      }
+
       float frontRange = (float)tele_front / 1000.0f;
       float sideRange  = (float)(mission_goleft ? tele_left : tele_right) / 1000.0f;
       // The wall follower treats 0 as "touching a wall". Our 0 means "nothing
@@ -442,6 +493,7 @@ PARAM_GROUP_START(mission)
   PARAM_ADD(PARAM_UINT32, height,   &mission_height)
   PARAM_ADD(PARAM_UINT32, walldist, &mission_walldist)
   PARAM_ADD(PARAM_UINT8,  goleft,   &mission_goleft)
+  PARAM_ADD(PARAM_UINT8,  wallfollow, &mission_wallfollow)
 PARAM_GROUP_STOP(mission)
 
 PARAM_GROUP_START(tele)
@@ -458,6 +510,7 @@ PARAM_GROUP_START(tele)
   PARAM_ADD(PARAM_INT16,  z,       &tele_z)
   PARAM_ADD(PARAM_UINT16, samples, &tele_samples)
   PARAM_ADD(PARAM_UINT8,  phase,   &tele_phase)
+  PARAM_ADD(PARAM_UINT8,  sup,     &tele_sup)
 PARAM_GROUP_STOP(tele)
 
 // --- Log variables --------------------------------------------------------
@@ -467,6 +520,7 @@ LOG_GROUP_START(tele)
   LOG_ADD(LOG_UINT16, vbat,    &tele_vbat)
   LOG_ADD(LOG_UINT16, samples, &tele_samples)
   LOG_ADD(LOG_UINT8,  phase,   &tele_phase)
+  LOG_ADD(LOG_UINT8,  sup,     &tele_sup)
   LOG_ADD(LOG_INT16,  x,       &tele_x)
   LOG_ADD(LOG_INT16,  y,       &tele_y)
   LOG_ADD(LOG_INT16,  z,       &tele_z)

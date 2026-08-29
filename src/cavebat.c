@@ -63,6 +63,23 @@ static uint32_t mission_minobst = 200;
 // centimetres and landing, which reads as a broken controller.
 static uint8_t  tele_clear = 0;
 
+// Master switch for CaveBat's own safety guards. OFF by default: every guard
+// added so far has fired on a false positive and ended a healthy flight (a
+// side ranger catching the floor during the climb; normal LiPo sag read as a
+// collapsed battery). With this at 0 nothing in this file will abort a
+// mission -- it flies the timer out and lands normally.
+//
+// tele_canfly and tele_clear are still computed and published either way, so
+// the app can show battery and obstacle status as INFORMATION without any of
+// it stopping a flight.
+//
+// This does NOT disable Bitcraze's supervisor. Tumble detection and the
+// critical-battery cutoff live in the stock firmware and still apply.
+//
+// Set mission.guards = 1 to put the pre-flight refusals and in-flight aborts
+// back on.
+static uint8_t  mission_guards = 0;
+
 // 0 means "no reading" (out of range) and must NOT count as an obstacle,
 // otherwise open space would read as blocked.
 static bool sideBlocked(uint16_t mm) {
@@ -122,14 +139,14 @@ void appMain(void) {
     tele_z     = (int16_t)(logGetFloat(idZ) * 1000.0f);
 
     // 2. Flight State Machine
-    if (mission_state == 1 && !is_flying && !tele_canfly) {
+    if (mission_guards && mission_state == 1 && !is_flying && !tele_canfly) {
         // Too low to climb. Refuse rather than half-fly: an underpowered
         // takeoff looks like a software fault but is really a flat battery.
         DEBUG_PRINT("CAVEBAT: Takeoff REFUSED, battery %d mV < %d mV min\n",
                     (int)tele_vbat, (int)mission_minvbat);
         mission_state = 0; // clear the request so the app sees it rejected
 
-    } else if (mission_state == 1 && !is_flying && !tele_clear) {
+    } else if (mission_guards && mission_state == 1 && !is_flying && !tele_clear) {
         // Something is already inside the clearance limit. Taking off here just
         // trips the in-flight abort ~100ms later, so the drone hops a few
         // centimetres and lands -- which looks like a broken controller rather
@@ -187,7 +204,9 @@ void appMain(void) {
             // beats the supervisor cutting the motors at altitude. Skipped
             // during the climb, where spin-up sag is worst, and requires the
             // reading to persist so one dip cannot end a flight.
-            if ((int32_t)(xTaskGetTickCount() - climb_done_tick) < 0) {
+            if (!mission_guards) {
+                lowbat_streak = 0;
+            } else if ((int32_t)(xTaskGetTickCount() - climb_done_tick) < 0) {
                 lowbat_streak = 0;
             } else if (tele_vbat > 0 &&
                        tele_vbat < (mission_minvbat - VBAT_INFLIGHT_MARGIN_MV)) {
@@ -206,7 +225,9 @@ void appMain(void) {
             // obstacle to persist as well: a single stray short reading from a
             // ToF sensor should not end a flight, but three in a row at 10Hz is
             // 0.3s, still fast enough to be useful.
-            if ((int32_t)(xTaskGetTickCount() - climb_done_tick) < 0) {
+            if (!mission_guards) {
+                obstacle_streak = 0;
+            } else if ((int32_t)(xTaskGetTickCount() - climb_done_tick) < 0) {
                 obstacle_streak = 0;
             } else if (sideBlocked(tele_front) || sideBlocked(tele_back) ||
                        sideBlocked(tele_left)  || sideBlocked(tele_right)) {
@@ -290,6 +311,7 @@ PARAM_GROUP_START(mission)
   PARAM_ADD(PARAM_UINT32, sampledist, &mission_sampledist)
   PARAM_ADD(PARAM_UINT32, minvbat,    &mission_minvbat)
   PARAM_ADD(PARAM_UINT32, minobst,    &mission_minobst)
+  PARAM_ADD(PARAM_UINT8,  guards,     &mission_guards)
 PARAM_GROUP_STOP(mission)
 
 // --- Log Registration ---

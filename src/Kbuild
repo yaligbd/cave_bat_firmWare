@@ -1,10 +1,12 @@
-# Building cavebat_v2: the autonomous survey flight (wall following, recorded
-# waypoints, retrace on the way back, download over CRTP port 14).
+# cavebat_v3: the proven flight logic (tag v2-full-mission) plus onboard
+# recording and download. Only ONE of these may be built -- they all define
+# appMain().
 #
-# cavebat.c is the previous single-hover firmware. It is kept in the tree
-# because it is the last version verified flying end to end (tag
-# v2-full-mission), but it must NOT be built at the same time -- both define
-# appMain() and the link would fail. Swap the two obj-y lines to go back.
-obj-y += cavebat_v2.o
-obj-y += wallfollowing_multiranger_onboard.o
+#   cavebat.c     the version that flew a complete mission twice
+#   cavebat_v2.c  wall following + velocity control. Crashed on takeoff, and
+#                 changed too much at once to tell why. Parked, not deleted.
+#   cavebat_v3.c  cavebat.c + recording. Change one thing at a time from here.
+obj-y += cavebat_v3.o
 # obj-y += cavebat.o
+# obj-y += cavebat_v2.o
+# obj-y += wallfollowing_multiranger_onboard.o

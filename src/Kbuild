@@ -9,8 +9,8 @@
 #   cavebat_i2cscan.c  DIAGNOSTIC, does not fly. Scans the deck I2C bus.
 #   cavebat_v3.c       an earlier recording attempt; flipped on takeoff.
 #   cavebat_v2.c       wall following; also flipped on takeoff.
-obj-y += cavebat.o
-# obj-y += cavebat_record.o
+# obj-y += cavebat.o
+obj-y += cavebat_record.o
 # obj-y += cavebat_i2cscan.o
 # obj-y += cavebat_v3.o
 # obj-y += cavebat_v2.o

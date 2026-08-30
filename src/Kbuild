@@ -1,17 +1,19 @@
-# cavebat.c is the FLYING firmware (tags v4-flying-withMR / v5-first-full-cycle)
-# and is what is on the drone. Only ONE of these may be built -- they all
-# define appMain().
+# Only ONE cavebat_*.c may be built -- they all define appMain().
 #
-#   cavebat.c          FLIES. Takeoff, timed hover, land. No recording.
-#   cavebat_record.c   cavebat.c + onboard recording and CRTP-14 download.
-#                      BUILT AND READY, NOT FLASHED. Binary saved as
-#                      pending-cavebat-record.bin.
+#   cavebat.c          flies. Takeoff, timed hover, land. No recording.
+#   cavebat_record.c   + onboard recording and CRTP-14 download. ON THE DRONE
+#                      NOW (tag v6-onboard-recording).
+#   cavebat_wall.c     + wall following. BEING PREPARED, not yet flown.
 #   cavebat_i2cscan.c  DIAGNOSTIC, does not fly. Scans the deck I2C bus.
 #   cavebat_v3.c       an earlier recording attempt; flipped on takeoff.
-#   cavebat_v2.c       wall following; also flipped on takeoff.
+#   cavebat_v2.c       an earlier wall-following attempt; also flipped.
+#
+# wallfollowing_multiranger_onboard.o is Bitcraze's own follower and is only
+# needed by cavebat_wall.c.
+obj-y += cavebat_wall.o
+obj-y += wallfollowing_multiranger_onboard.o
+# obj-y += cavebat_record.o
 # obj-y += cavebat.o
-obj-y += cavebat_record.o
 # obj-y += cavebat_i2cscan.o
 # obj-y += cavebat_v3.o
 # obj-y += cavebat_v2.o
-# obj-y += wallfollowing_multiranger_onboard.o

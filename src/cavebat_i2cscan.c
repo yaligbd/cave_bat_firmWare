@@ -36,6 +36,7 @@
 #include "i2cdev.h"
 #include "param.h"
 #include "deck_core.h"
+#include "pca95x4.h"
 
 #define DEBUG_MODULE "I2CSCAN"
 #include "debug.h"
@@ -100,6 +101,41 @@ void appMain(void) {
                   i, (int)di->vid, (int)di->pid, nm);
     }
     DEBUG_PRINT("  (Multi-ranger is vid=0xBC pid=0x0C)\n");
+
+    // --- Probe 0x20 every way the firmware itself might ------------------
+    //
+    // My first probe was a RAW read with no register address. pca95x4Test(),
+    // which is what multiranger.c actually depends on, does a REGISTER read:
+    // write the register address, then read. Those are different transactions
+    // and a chip can answer one and not the other. Testing only my own way was
+    // sloppy, so here every method is tried, with two devices we KNOW are
+    // present as controls. If the controls pass and 0x20 fails on all of them,
+    // the chip is genuinely silent. If any method reaches 0x20, my earlier
+    // conclusion was wrong.
+    {
+      uint8_t b;
+      pca95x4Init();   // sets the module's I2C bus to I2C1
+
+      DEBUG_PRINT("--- probing 0x20 (multiranger expander) ---\n");
+      DEBUG_PRINT("  pca95x4Test (firmware own test): %s\n",
+                  pca95x4Test(PCA95X4_DEFAULT_ADDRESS) ? "PASS" : "fail");
+      for (uint8_t reg = 0; reg <= 3; reg++) {
+        DEBUG_PRINT("  register read reg=%d: %s\n", (int)reg,
+                    i2cdevReadByte(I2C1_DEV, 0x20, reg, &b) ? "PASS" : "fail");
+      }
+      DEBUG_PRINT("  raw read (no register): %s\n",
+                  i2cdevRead(I2C1_DEV, 0x20, 1, &b) ? "PASS" : "fail");
+
+      DEBUG_PRINT("--- controls, devices known to be present ---\n");
+      DEBUG_PRINT("  0x2A raw read      : %s\n",
+                  i2cdevRead(I2C1_DEV, 0x2A, 1, &b) ? "PASS" : "fail");
+      DEBUG_PRINT("  0x2A register read : %s\n",
+                  i2cdevReadByte(I2C1_DEV, 0x2A, 0, &b) ? "PASS" : "fail");
+      DEBUG_PRINT("  0x50 raw read      : %s\n",
+                  i2cdevRead(I2C1_DEV, 0x50, 1, &b) ? "PASS" : "fail");
+      DEBUG_PRINT("  0x50 register read : %s\n",
+                  i2cdevReadByte(I2C1_DEV, 0x50, 0, &b) ? "PASS" : "fail");
+    }
 
     DEBUG_PRINT("=== I2C1 scan (deck bus) ===\n");
 

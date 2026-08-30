@@ -1,7 +1,8 @@
-# cavebat.c is the flying firmware (tag v3-flying-noMR). Only ONE may be built.
+# cavebat.c is the flying firmware. Only ONE of these may be built.
 #
 #   cavebat.c          FLIES. Takeoff, timed hover, land.
-#   cavebat_i2cscan.c  DIAGNOSTIC, does not fly. Scans the deck I2C bus.
+#   cavebat_i2cscan.c  DIAGNOSTIC, does not fly. Scans the deck I2C bus and
+#                      lists the decks the drone can see.
 #   cavebat_v3.c       cavebat.c + recording. Flipped on takeoff, unexplained.
 #   cavebat_v2.c       wall following. Also flipped on takeoff.
 obj-y += cavebat.o

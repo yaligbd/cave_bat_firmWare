@@ -1,12 +1,11 @@
-# cavebat.c is the version verified flying (tag v2-full-mission) and is what
-# known-good/cavebat-v2-full-mission.bin contains. Only ONE of these may be
-# built -- they all define appMain().
+# cavebat.c is the flying firmware (tag v3-flying-noMR). Only ONE may be built.
 #
-#   cavebat.c     FLIES. Takeoff, timed hover, land.
-#   cavebat_v3.c  cavebat.c + onboard recording. Flipped on takeoff; cause not
-#                 yet found. See the note in that file.
-#   cavebat_v2.c  wall following + velocity control. Also flipped on takeoff.
+#   cavebat.c          FLIES. Takeoff, timed hover, land.
+#   cavebat_i2cscan.c  DIAGNOSTIC, does not fly. Scans the deck I2C bus.
+#   cavebat_v3.c       cavebat.c + recording. Flipped on takeoff, unexplained.
+#   cavebat_v2.c       wall following. Also flipped on takeoff.
 obj-y += cavebat.o
+# obj-y += cavebat_i2cscan.o
 # obj-y += cavebat_v3.o
 # obj-y += cavebat_v2.o
 # obj-y += wallfollowing_multiranger_onboard.o

@@ -1,5 +1,5 @@
 CONFIG_APP_ENABLE=y
 CONFIG_APP_PRIORITY=1
-# 350 is the Bitcraze default. Raised because cavebat_v2 runs the wall-follower
-# state machine plus float maths inside the same app task.
-CONFIG_APP_STACKSIZE=500
+# 350 is the Bitcraze default and what the flying build used. It was raised to
+# 500 for cavebat_v2; restored here so a rebuild reproduces the flying binary.
+CONFIG_APP_STACKSIZE=350

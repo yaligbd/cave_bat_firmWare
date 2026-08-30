@@ -10,6 +10,23 @@
 //   - high-level commander only; no velocity setpoints, no commander handover
 //   - no wall following
 //
+// STATUS: DOES NOT FLY. On its first test the drone hovered for about half a
+// second and then flipped onto its back. Held in the hand the motors ran for
+// the full timer, so the mission logic is intact -- it is the flight itself
+// that fails. v2 failed the same way.
+//
+// Cause not found. What was checked and cleared:
+//   - CRTP port 14 is genuinely unused in this firmware (see crtp.h), so
+//     registering a callback on it displaces nothing.
+//   - The diff against cavebat.c is additions only; no flight code was edited.
+//   - RAM went from 85084 to 88224 bytes with ~42KB still free.
+// What has NOT been ruled out: the 2.5KB static buffer and the stack-size
+// change shifting memory layout, and anything about the airframe itself.
+//
+// The controlled experiment is to fly cavebat.c again on the same drone in the
+// same place. If it flies, the fault is in this file. If it also flips, the
+// fault predates both.
+//
 // v2 changed all of those at once and crashed on takeoff, leaving four
 // suspects and no way to separate them. If this version flies, recording is
 // proven and the flight is untouched. Anything more goes in one change at a

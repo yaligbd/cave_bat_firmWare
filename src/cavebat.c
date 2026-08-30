@@ -93,6 +93,15 @@ static bool sideBlocked(uint16_t mm) {
   return (mm > 0) && (mm < (uint16_t)mission_minobst);
 }
 
+// logGetFloat() ASSERTs on an invalid id, which halts the drone. A sensor that
+// is not present -- because its deck driver is not in the build, or the deck
+// did not initialise -- yields exactly such an id. Reading through this helper
+// means the firmware runs with or without the Multi-ranger fitted instead of
+// dying on the first read.
+static float safeLogFloat(logVarId_t id) {
+  return logVarIdIsValid(id) ? logGetFloat(id) : 0.0f;
+}
+
 static uint16_t clampRange(float mm) {
   if (mm <= 0.0f || mm > 3000.0f) return 0;
   return (uint16_t)mm;
@@ -131,19 +140,19 @@ void appMain(void) {
   while (1) {
     // 1. Update Telemetry
     tele_alive++;
-    tele_vbat  = (uint16_t)(logGetFloat(idVbat) * 1000.0f);
+    tele_vbat  = (uint16_t)(safeLogFloat(idVbat) * 1000.0f);
     tele_canfly = (tele_vbat >= mission_minvbat) ? 1 : 0;
     tele_clear = (sideBlocked(tele_front) || sideBlocked(tele_back) ||
                   sideBlocked(tele_left)  || sideBlocked(tele_right)) ? 0 : 1;
-    tele_front = clampRange(logGetFloat(idFront));
-    tele_back  = clampRange(logGetFloat(idBack));
-    tele_left  = clampRange(logGetFloat(idLeft));
-    tele_right = clampRange(logGetFloat(idRight));
-    tele_up    = clampRange(logGetFloat(idUp));
-    tele_down  = clampRange(logGetFloat(idDown));
-    tele_x     = (int16_t)(logGetFloat(idX) * 1000.0f);
-    tele_y     = (int16_t)(logGetFloat(idY) * 1000.0f);
-    tele_z     = (int16_t)(logGetFloat(idZ) * 1000.0f);
+    tele_front = clampRange(safeLogFloat(idFront));
+    tele_back  = clampRange(safeLogFloat(idBack));
+    tele_left  = clampRange(safeLogFloat(idLeft));
+    tele_right = clampRange(safeLogFloat(idRight));
+    tele_up    = clampRange(safeLogFloat(idUp));
+    tele_down  = clampRange(safeLogFloat(idDown));
+    tele_x     = (int16_t)(safeLogFloat(idX) * 1000.0f);
+    tele_y     = (int16_t)(safeLogFloat(idY) * 1000.0f);
+    tele_z     = (int16_t)(safeLogFloat(idZ) * 1000.0f);
 
     // 2. Flight State Machine
     if (mission_guards && mission_state == 1 && !is_flying && !tele_canfly) {

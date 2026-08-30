@@ -1,5 +1,19 @@
 CONFIG_APP_ENABLE=y
 CONFIG_APP_PRIORITY=1
-# 350 is the Bitcraze default and what the flying build used. It was raised to
-# 500 for cavebat_v2; restored here so a rebuild reproduces the flying binary.
 CONFIG_APP_STACKSIZE=350
+
+# Multi-ranger driver left OUT of this build.
+#
+# Why: the deck's five sensors have failed to initialise on every recent boot,
+# and deckTest() failing means system.c never calls systemStart(). The whole
+# firmware then never runs -- no flight, no telemetry, every command silently
+# ignored. Excluding the driver means the deck is never probed or tested, the
+# self-test passes on the Flow deck alone, and the drone boots and flies.
+#
+# What is lost: the range sensors. Nothing else. Range streaming was already
+# switched off in the app, and the takeoff/hover/land mission does not read
+# them (mission.guards = 0). cavebat.c reads them through safeLogFloat(), which
+# returns 0 for a sensor that is not present rather than asserting.
+#
+# To put it back, delete this line and rebuild.
+CONFIG_DECK_MULTIRANGER=n

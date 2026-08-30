@@ -35,6 +35,7 @@
 #include "task.h"
 #include "i2cdev.h"
 #include "param.h"
+#include "deck_core.h"
 
 #define DEBUG_MODULE "I2CSCAN"
 #include "debug.h"
@@ -76,7 +77,30 @@ void appMain(void) {
   // scan can collide with a driver mid-transaction and mis-report.
   vTaskDelay(M2T(4000));
 
+  // Which decks does the drone actually SEE?
+  //
+  // This is a different question from the I2C scan, and the two together are
+  // what matter. A deck announces itself over a 1-wire ID memory on its own
+  // dedicated pin; its sensors talk over I2C on two other pins. So:
+  //
+  //   deck listed + 0x20 answers    -> everything is connected
+  //   deck listed + 0x20 silent     -> the deck is seated and identifies
+  //                                    itself, but its two I2C pins are not
+  //                                    getting through
+  //   deck NOT listed               -> the drone cannot see the deck at all;
+  //                                    this is not an I2C problem
   while (1) {
+    DEBUG_PRINT("=== decks the drone can see ===\n");
+    int nDecks = deckCount();
+    DEBUG_PRINT("  deckCount = %d\n", nDecks);
+    for (int i = 0; i < nDecks; i++) {
+      DeckInfo *di = deckInfo(i);
+      const char *nm = (di->driver && di->driver->name) ? di->driver->name : "(no driver)";
+      DEBUG_PRINT("  deck %d: vid=0x%02X pid=0x%02X %s\n",
+                  i, (int)di->vid, (int)di->pid, nm);
+    }
+    DEBUG_PRINT("  (Multi-ranger is vid=0xBC pid=0x0C)\n");
+
     DEBUG_PRINT("=== I2C1 scan (deck bus) ===\n");
 
     int found = 0;

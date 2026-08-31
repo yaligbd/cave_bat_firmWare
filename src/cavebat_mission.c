@@ -252,14 +252,31 @@ static uint32_t mission_walldist = 400;
 // Degrees turned per step at a corner. Small enough that the drone re-reads
 // its sensors several times through a right angle instead of committing to
 // the whole turn on one reading.
-#define TURN_IN_DEG      30.0f
-#define TURN_OUT_DEG     25.0f
+#define TURN_IN_DEG      25.0f
+#define TURN_OUT_DEG     20.0f
+
+// A corner turn is only believed after this many decisions in a row agree.
+// Turning right means turning TOWARD the wall, so it is held to the stricter
+// count: the cost of a wrong left turn is a wasted step, the cost of a wrong
+// right turn is the wall.
+#define CONFIRM_IN       2
+#define CONFIRM_OUT      3
+static uint8_t confirm_in = 0;
+static uint8_t confirm_out = 0;
 
 // The most the heading may be trimmed on a following step, and how hard to
 // trim per millimetre of error. 200mm off target gives 15 degrees, so the
 // drone converges over a few steps rather than swinging back and forth.
-#define MAX_TRIM_DEG     20.0f
-#define TRIM_DEG_PER_MM  0.075f
+// Halved from 20. At 20 degrees a single reading 400mm off target swung the
+// drone a fifth of a right angle, and with the wall only 400mm away there is
+// no room for a correction that large to be wrong.
+#define MAX_TRIM_DEG     10.0f
+#define TRIM_DEG_PER_MM  0.04f
+
+// Closer than this to the wall is an emergency, and the only allowed response
+// is to turn away from it. No reading, however confident, may turn the drone
+// toward a wall this close.
+#define WALL_PANIC_MM    220
 
 // Beyond this the wall on the right has gone, and the drone treats it as an
 // outward corner rather than as a wall it is merely far from. Sits above
@@ -281,6 +298,44 @@ static float mission_yaw = 0.0f;
 
 // Keep a heading in -pi..pi so it can be stored in an int16 of degrees and so
 // repeated turning in one direction never runs away.
+// Steering decisions are made from a MEDIAN of recent readings, never from one.
+//
+// This is why wall following flew into the wall. Every decision came from a
+// single instantaneous reading and could command up to 25 degrees of turn, and
+// a VL53L1x returns 0 both for "nothing in range" and for a read that simply
+// failed. One failed read on the right-hand sensor was therefore indis-
+// tinguishable from the wall ending, and the response to the wall ending is to
+// turn RIGHT -- into the wall. Two or three of those in a row and the drone is
+// pointed at the wall and flying.
+//
+// A median of five throws away any pair of outliers outright. It costs half a
+// second of history, which is nothing against a step that takes about one.
+#define RANGE_HIST 5
+static uint16_t hist_front[RANGE_HIST];
+static uint16_t hist_right[RANGE_HIST];
+static uint8_t  hist_pos = 0;
+static uint8_t  hist_fill = 0;
+
+static void pushRanges(uint16_t f, uint16_t r) {
+  hist_front[hist_pos] = f;
+  hist_right[hist_pos] = r;
+  hist_pos = (uint8_t)((hist_pos + 1) % RANGE_HIST);
+  if (hist_fill < RANGE_HIST) hist_fill++;
+}
+
+static uint16_t medianOf(const uint16_t *buf) {
+  uint16_t t[RANGE_HIST];
+  uint8_t n = hist_fill;
+  for (uint8_t i = 0; i < n; i++) t[i] = buf[i];
+  for (uint8_t i = 1; i < n; i++) {          // insertion sort, n is 5
+    uint16_t v = t[i];
+    int8_t j = (int8_t)i - 1;
+    while (j >= 0 && t[j] > v) { t[j + 1] = t[j]; j--; }
+    t[j + 1] = v;
+  }
+  return n ? t[n / 2] : 0;
+}
+
 static float wrapYaw(float y) {
   while (y >  3.14159265f) y -= 6.28318531f;
   while (y < -3.14159265f) y += 6.28318531f;
@@ -363,7 +418,7 @@ static void issueStep(float tx_m, float ty_m, float tz_m, float yaw_rad) {
   // round faster than the aircraft can follow.
   float dyaw = wrapYaw(yaw_rad - mission_yaw);
   if (dyaw < 0) dyaw = -dyaw;
-  float turn_dur = dyaw * RAD2DEG / 45.0f;   // 45 deg/s, unhurried
+  float turn_dur = dyaw * RAD2DEG / 25.0f;   // 25 deg/s, deliberately slow
   if (turn_dur > dur) dur = turn_dur;
   if (dur > 4.0f) dur = 4.0f;
   mission_yaw = wrapYaw(yaw_rad);
@@ -520,6 +575,9 @@ void appMain(void) {
     tele_up    = clampRange(safeLogFloat(idUp));
     tele_down  = clampRange(safeLogFloat(idDown));
     tele_yaw   = (int16_t)(mission_yaw * RAD2DEG);
+    // Sampled at the full 10Hz loop rate rather than once per step, so a step
+    // that lasts a second is decided on ten readings instead of one.
+    pushRanges(tele_front, tele_right);
     tele_x     = (int16_t)(safeLogFloat(idX) * 1000.0f);
     tele_y     = (int16_t)(safeLogFloat(idY) * 1000.0f);
     tele_z     = (int16_t)(safeLogFloat(idZ) * 1000.0f);
@@ -654,6 +712,10 @@ void appMain(void) {
         // heading in the mission is relative to how it was placed, which is
         // what a pilot expects and what the estimator assumes.
         mission_yaw = 0.0f;
+        confirm_in = 0;
+        confirm_out = 0;
+        hist_pos = 0;
+        hist_fill = 0;
         waypoint_count = 0;
         step_active = false;
         climb_done_tick = xTaskGetTickCount()
@@ -756,56 +818,84 @@ void appMain(void) {
                     // --- Decide one step ---------------------------------
                     //
                     // The drone steers rather than strafes, so everything here
-                    // is relative to where it is currently pointing. Forward
-                    // in the world is (cos yaw, sin yaw); the wall is on the
-                    // right, which is 90 degrees clockwise from that.
+                    // is relative to where it is currently pointing. Forward in
+                    // the world is (cos yaw, sin yaw); the wall is on the
+                    // right, 90 degrees clockwise from that.
+                    //
+                    // Every reading used here is a MEDIAN of the last half
+                    // second, never a single sample. The first version steered
+                    // on instantaneous values and flew into the wall, because a
+                    // VL53L1x returning 0 for a failed read is indistinguish-
+                    // able from one returning 0 for "nothing there", and the
+                    // response to "nothing there" is to turn toward the wall.
                     float cx = tele_x / 1000.0f;
                     float cy = tele_y / 1000.0f;
                     float cz = mission_height / 1000.0f;
 
-                    uint16_t f = tele_front;
-                    uint16_t r = tele_right;
+                    uint16_t f = medianOf(hist_front);
+                    uint16_t r = medianOf(hist_right);
 
                     float newYaw = mission_yaw;
                     float advance = 0.0f;   // metres along the NEW heading
 
-                    if ((f > 0) && (f < FRONT_STOP_MM)) {
+                    bool frontClose = (f > 0) && (f < FRONT_STOP_MM);
+                    bool wallGone   = (r == 0) || (r > WALL_LOST_MM);
+                    bool tooClose   = (r > 0) && (r < WALL_PANIC_MM);
+
+                    // Streaks, so one odd decision cannot turn the aircraft.
+                    if (frontClose) confirm_in++;  else confirm_in = 0;
+                    if (wallGone)   confirm_out++; else confirm_out = 0;
+
+                    if (tooClose) {
+                        // TOO CLOSE. This outranks everything, including a
+                        // wall detected ahead, because whatever else is true
+                        // the drone is about to touch the thing it is
+                        // following. Turn away, do not advance.
+                        newYaw = wrapYaw(mission_yaw + TURN_IN_DEG * DEG2RAD);
+                        advance = 0.0f;
+                        confirm_in = 0;
+                        confirm_out = 0;
+                        DEBUG_PRINT("CAVEBAT: too close r=%d, turning away\n", (int)r);
+
+                    } else if (confirm_in >= CONFIRM_IN) {
                         // INWARD CORNER. The wall has turned across the path,
                         // so the way on is to the left. Rotate on the spot and
                         // look again -- several small turns through a right
-                        // angle, each one re-read, rather than one blind 90.
+                        // angle, each re-read, rather than one blind ninety.
                         newYaw = wrapYaw(mission_yaw + TURN_IN_DEG * DEG2RAD);
                         advance = 0.0f;
                         DEBUG_PRINT("CAVEBAT: corner in, f=%d, turning left\n", (int)f);
 
-                    } else if ((r == 0) || (r > WALL_LOST_MM)) {
-                        // OUTWARD CORNER, or no wall found yet.
+                    } else if (confirm_out >= CONFIRM_OUT && waypoint_count > 1) {
+                        // OUTWARD CORNER. The wall turned away from under the
+                        // drone, so it follows it round by turning right.
                         //
-                        // These are the same manoeuvre. If the drone was
-                        // following a wall and it vanished, the wall turned
-                        // away and the drone follows it round by turning right
-                        // and creeping forward. If it never had a wall, it is
-                        // searching, and turning right while advancing sweeps
-                        // for one instead of flying in a straight line past it.
-                        if (waypoint_count > 1) {
-                            newYaw = wrapYaw(mission_yaw - TURN_OUT_DEG * DEG2RAD);
-                            advance = STEP_CORNER_MM / 1000.0f;
-                            DEBUG_PRINT("CAVEBAT: corner out, r gone, turning right\n");
-                        } else {
-                            // Nothing found yet and nowhere to turn back to.
-                            // Fly straight and keep looking.
-                            advance = STEP_FWD_MM / 1000.0f;
-                        }
+                        // Turning right means turning TOWARD where the wall
+                        // was, which is the one turn that can end in a
+                        // collision, so it needs three agreeing decisions and
+                        // it does not advance while turning. The step after
+                        // this one either finds the wall again and resumes
+                        // following, or turns again.
+                        newYaw = wrapYaw(mission_yaw - TURN_OUT_DEG * DEG2RAD);
+                        advance = 0.0f;
+                        DEBUG_PRINT("CAVEBAT: corner out, turning right\n");
+
+                    } else if (wallGone) {
+                        // No wall on the right, and not yet confirmed as a
+                        // corner. Hold the heading and fly on. This is both the
+                        // search that opens the mission and the safe answer to
+                        // a single dropped reading: carrying straight on cannot
+                        // put the drone into a wall it has lost track of.
+                        advance = STEP_FWD_MM / 1000.0f;
 
                     } else {
                         // FOLLOWING. Trim the heading in proportion to how far
                         // off the target distance the wall is, then fly on.
-                        // Too far from the wall turns toward it (right, which
-                        // is a negative yaw change); too close turns away.
+                        // Too far turns toward it, too close turns away.
                         //
-                        // Proportional rather than fixed so a gentle curve gets
-                        // a gentle correction. A fixed step would make the
-                        // drone saw back and forth along a straight wall.
+                        // Proportional so a gentle curve gets a gentle
+                        // correction, and capped hard: with the wall 400mm away
+                        // there is no room for a large correction to be wrong.
                         float err = (float)r - (float)mission_walldist;
                         float trim = -err * TRIM_DEG_PER_MM;
                         if (trim >  MAX_TRIM_DEG) trim =  MAX_TRIM_DEG;

@@ -1,19 +1,15 @@
-# Only ONE cavebat_*.c may be built -- they all define appMain().
+# Only ONE cavebat_*.c defining appMain() may be built.
 #
-#   cavebat.c          flies. Takeoff, timed hover, land. No recording.
-#   cavebat_record.c   + onboard recording and CRTP-14 download. ON THE DRONE
-#                      NOW (tag v6-onboard-recording).
-#   cavebat_wall.c     + wall following. BEING PREPARED, not yet flown.
-#   cavebat_i2cscan.c  DIAGNOSTIC, does not fly. Scans the deck I2C bus.
-#   cavebat_v3.c       an earlier recording attempt; flipped on takeoff.
-#   cavebat_v2.c       an earlier wall-following attempt; also flipped.
+#   cavebat_record.c   flies + records onboard + CRTP-14 download. CURRENT.
+#   cavebat_wall.c     + wall following. Built and waiting, not flown.
+#   cavebat.c          flies, no recording.
+#   cavebat_i2cscan.c  DIAGNOSTIC, does not fly.
 #
-# wallfollowing_multiranger_onboard.o is Bitcraze's own follower and is only
-# needed by cavebat_wall.c.
+# cavebat_multiranger.c is NOT an appMain - it is the deck driver, replacing
+# the stock one (CONFIG_DECK_MULTIRANGER=n in app-config). It is always built.
+obj-y += cavebat_record.o
+obj-y += cavebat_multiranger.o
 # obj-y += cavebat_wall.o
 # obj-y += wallfollowing_multiranger_onboard.o
-obj-y += cavebat_record.o
 # obj-y += cavebat.o
 # obj-y += cavebat_i2cscan.o
-# obj-y += cavebat_v3.o
-# obj-y += cavebat_v2.o

@@ -2,24 +2,12 @@ CONFIG_APP_ENABLE=y
 CONFIG_APP_PRIORITY=1
 CONFIG_APP_STACKSIZE=350
 
-# The Multi-ranger driver is ENABLED (this is the firmware default).
-#
-# It was excluded for a while because the deck's five sensors failed to
-# initialise on every boot, which stops the whole firmware starting. That was
-# NOT a fault with the deck. Every one of those boots followed a WARM reset --
-# cfloader's -w option reboots the processor without power-cycling the deck,
-# and the deck's I/O expander does not come back from a soft reset.
-#
-# After a genuine power cycle the expander answers every probe, including the
-# firmware's own pca95x4Test().
-#
-# So: after flashing, POWER-CYCLE the drone before flying. A warm reboot can
-# leave the deck unresponsive and the drone will refuse to start.
+# The stock Multi-ranger driver is OUT, and src/cavebat_multiranger.c is built
+# in its place: the same driver with a robust init. See the header of that file
+# for why. Turning this back on would register two drivers for the same deck.
+CONFIG_DECK_MULTIRANGER=n
 
 # NOTE: this file is a kconfig fragment and the result is CACHED in build/.config.
-# Changing a line here does NOT take effect on the next make -- the old setting
-# survives and the binary is silently unchanged. After editing this file:
-#
+# Editing it does NOT take effect on the next make. After changing it:
 #     rm -rf build && make
-#
 # Verify with: grep MULTIRANGER build/include/generated/autoconf.h

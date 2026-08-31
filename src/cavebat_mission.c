@@ -213,7 +213,7 @@ static uint32_t mission_walldist = 400;
 
 // How far to move per step, forward and sideways. Small steps mean the drone
 // re-reads its sensors often and can never commit far to a bad decision.
-#define STEP_FWD_MM      250
+#define STEP_FWD_MM      200
 #define STEP_SIDE_MM     150
 
 // Something this close ahead stops the outbound leg advancing.
@@ -225,7 +225,10 @@ static uint32_t mission_walldist = 400;
 #define GEOFENCE_MM     4000
 
 // Step speed, m/s. Matches the climb rate the takeoff already uses.
-#define STEP_SPEED_MS    0.3f
+// Slowed from 0.3. Every metre now gets half as much again in sensor readings
+// and gives the estimator more time to keep up, and nothing about this mission
+// benefits from being quick.
+#define STEP_SPEED_MS    0.2f
 
 // --- Turning ---------------------------------------------------------------
 //
@@ -347,6 +350,34 @@ static float wrapYaw(float y) {
 // would strand the drone in the air until the timer ran out.
 #define STEP_GRACE_MS    1500
 
+// Hold still for this long after a turn before flying anywhere.
+//
+// This is the one difference between the flights that work and the flights
+// that do not. Hover has not crashed in a long time; wall following crashes
+// about half the time. Hover never turns. Wall following turns.
+//
+// The Flow deck measures optical flow, and rotating over a floor produces
+// apparent translation that the estimator has to unpick using the gyro. For a
+// moment after a turn its position estimate is at its least trustworthy -- and
+// the old code commanded the next translation immediately, from exactly that
+// estimate. Every target is computed as "where I am, plus a step", so a
+// position estimate disturbed by rotation sends the drone to the wrong place
+// at speed.
+//
+// Standing still costs a second and lets the flow measurement settle before it
+// is trusted again. Not proven: no log of a crash was ever captured, so this
+// is reasoning from what distinguishes the two cases, not from a recording of
+// one going wrong.
+#define TURN_SETTLE_MS   1000
+
+// A yaw change smaller than this is a trim, not a turn, and does not need the
+// settle. Otherwise every following step would pause and the drone would take
+// all day to get anywhere.
+#define TURN_SETTLE_DEG  8.0f
+
+static TickType_t settle_until = 0;
+static float last_turn_deg = 0.0f;
+
 // Breadcrumbs. 64 covers a 60-second outbound leg at roughly a step a second,
 // with room to spare, for 256 bytes of RAM.
 #define MAX_WAYPOINTS 64
@@ -418,7 +449,8 @@ static void issueStep(float tx_m, float ty_m, float tz_m, float yaw_rad) {
   // round faster than the aircraft can follow.
   float dyaw = wrapYaw(yaw_rad - mission_yaw);
   if (dyaw < 0) dyaw = -dyaw;
-  float turn_dur = dyaw * RAD2DEG / 25.0f;   // 25 deg/s, deliberately slow
+  last_turn_deg = dyaw * RAD2DEG;
+  float turn_dur = last_turn_deg / 25.0f;   // 25 deg/s, deliberately slow
   if (turn_dur > dur) dur = turn_dur;
   if (dur > 4.0f) dur = 4.0f;
   mission_yaw = wrapYaw(yaw_rad);
@@ -716,6 +748,8 @@ void appMain(void) {
         confirm_out = 0;
         hist_pos = 0;
         hist_fill = 0;
+        settle_until = 0;
+        last_turn_deg = 0.0f;
         waypoint_count = 0;
         step_active = false;
         climb_done_tick = xTaskGetTickCount()
@@ -794,6 +828,16 @@ void appMain(void) {
                 if (step_active) {
                     step_active = false;
                     dropBreadcrumb();
+                    // A step that turned earns a pause before the next one.
+                    if (last_turn_deg >= TURN_SETTLE_DEG) {
+                        settle_until = xTaskGetTickCount() + M2T(TURN_SETTLE_MS);
+                    }
+                }
+
+                // Standing still after a turn. The high-level commander holds
+                // position on its own, so doing nothing here IS the hold.
+                if ((int32_t)(xTaskGetTickCount() - settle_until) < 0) {
+                    goto skip_step;
                 }
 
                 // Reasons to turn for home, checked before committing to
@@ -908,6 +952,7 @@ void appMain(void) {
                     float ny = cy + advance * sinf(newYaw);
                     issueStep(nx, ny, cz, newYaw);
                 }
+                skip_step: ;
             }
 
             // Entering the return leg from any of the branches above: rewind to

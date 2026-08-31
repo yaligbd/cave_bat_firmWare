@@ -1,13 +1,22 @@
 # Only ONE cavebat_*.c defining appMain() may be built.
 #
-#   cavebat_record.c   flies + records onboard + CRTP-14 download. CURRENT.
-#   cavebat_wall.c     + wall following. Built and waiting, not flown.
+#   cavebat_mission.c  the full life cycle. CURRENT.
+#                      Takes off, follows a wall out for half the timer,
+#                      retraces the route home, lands, records throughout.
+#                      Wall following is OFF unless mission.wallfollow = 1,
+#                      and with it off this behaves exactly like
+#                      cavebat_record.c below.
+#   cavebat_record.c   flies + records onboard + CRTP-14 download. Tag
+#                      v9-lifecycle. The fallback if the mission build misbehaves.
+#   cavebat_wall.c     an earlier wall-following attempt, velocity setpoints.
+#                      Superseded and never flown -- kept only as a record.
 #   cavebat.c          flies, no recording.
 #   cavebat_i2cscan.c  DIAGNOSTIC, does not fly.
 #
 # cavebat_multiranger.c is NOT an appMain - it is the deck driver, replacing
 # the stock one (CONFIG_DECK_MULTIRANGER=n in app-config). It is always built.
-obj-y += cavebat_record.o
+# obj-y += cavebat_record.o
+obj-y += cavebat_mission.o
 obj-y += cavebat_multiranger.o
 # obj-y += cavebat_wall.o
 # obj-y += wallfollowing_multiranger_onboard.o

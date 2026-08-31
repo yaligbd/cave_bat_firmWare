@@ -329,6 +329,50 @@ void appMain(void) {
         // App requested Takeoff
         DEBUG_PRINT("CAVEBAT: Initiating Takeoff to %d mm, battery %d mV\n",
                     (int)mission_height, (int)tele_vbat);
+
+        // Reset the position estimator and let it settle BEFORE lifting off.
+        //
+        // This is why takeoff was a coin flip. Roughly half of flights flipped
+        // within two seconds of leaving the ground -- and the giveaway was the
+        // down-facing sensor reading 2413mm while the up-facing one read
+        // nothing: the drone was inverted, looking at the ceiling. That flight
+        // then reported climbing to 6401mm of a requested 500mm.
+        //
+        // It was NOT the battery. The crashed flight sagged 497mV and the good
+        // one straight after it sagged 592mV, both from a full charge. Nor the
+        // floor: every flight is flown over the same towel.
+        //
+        // The drone sits on the ground for tens of seconds between boot and
+        // launch and the Kalman filter accumulates drift the whole time -- the
+        // boot log prints "ESTKALMAN: State out of bounds, resetting" before it
+        // has been asked to do anything at all. Taking off on that stale
+        // estimate means the controller's first act can be a violent correction
+        // toward a position the drone was never in. Sometimes the estimate
+        // happens to be good and it flies. That is the coin flip.
+        //
+        // Every one of Bitcraze's own autonomous examples resets the estimator
+        // and waits before flying. This firmware never did.
+        {
+          paramVarId_t resetId = paramGetVarId("kalman", "resetEstimation");
+          if (PARAM_VARID_IS_VALID(resetId)) {
+            paramSetInt(resetId, 1);
+            vTaskDelay(M2T(100));
+            paramSetInt(resetId, 0);
+            // Convergence takes about a second with a Flow deck. Two is the
+            // figure Bitcraze use, and it costs nothing but a pause on the pad.
+            // Telemetry freezes for this long because this task is the one that
+            // updates it. That is expected, not a stall.
+            vTaskDelay(M2T(2000));
+            DEBUG_PRINT("CAVEBAT: estimator reset, settled\n");
+          } else {
+            // Fly anyway. A missing parameter is a reason to warn, not to ground
+            // the aircraft -- unreset is exactly how it behaved until now.
+            DEBUG_PRINT("CAVEBAT: kalman.resetEstimation NOT FOUND, flying unreset\n");
+          }
+        }
+
+        // Started after the settle, so the recording clock and the first sample
+        // line up with the moment the drone actually leaves the ground.
         flight_start_time = xTaskGetTickCount();
         is_flying = true;
         // Each flight starts a fresh recording, and the drone never parks

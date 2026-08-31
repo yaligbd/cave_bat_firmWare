@@ -10,9 +10,9 @@
 #
 # wallfollowing_multiranger_onboard.o is Bitcraze's own follower and is only
 # needed by cavebat_wall.c.
-obj-y += cavebat_wall.o
-obj-y += wallfollowing_multiranger_onboard.o
-# obj-y += cavebat_record.o
+# obj-y += cavebat_wall.o
+# obj-y += wallfollowing_multiranger_onboard.o
+obj-y += cavebat_record.o
 # obj-y += cavebat.o
 # obj-y += cavebat_i2cscan.o
 # obj-y += cavebat_v3.o

@@ -194,9 +194,31 @@ static void bulkCrtpCb(CRTPPacket *pk) {
 
 // One sample per packet, index included so the app can tell a dropped packet
 // from a shifted one rather than silently mis-aligning every later sample.
+// Sends one packet without ever blocking indefinitely.
+//
+// crtpSendPacketBlock() waits forever for queue space. If the link is
+// congested or has dropped, that hangs this task permanently -- and this task
+// is the one running the mission and updating telemetry, so the whole drone
+// goes silent and unreachable until it is power cycled. Retry a bounded number
+// of times instead and give up, because a failed download is recoverable and a
+// hung flight controller is not.
+static bool sendPacketBounded(CRTPPacket *pk) {
+  for (int attempt = 0; attempt < 20; attempt++) {
+    if (crtpSendPacket(pk)) return true;
+    vTaskDelay(M2T(5));   // let the radio drain
+  }
+  return false;
+}
+
 static void sendRecording(void) {
   DEBUG_PRINT("CAVEBAT: sending %d samples\n", (int)sample_count);
+
+  // Zeroed, not left on the stack. CRTPPacket's header is a bitfield union, so
+  // assigning .port and .channel leaves the reserved bits as whatever happened
+  // to be on the stack -- a malformed header on every packet.
   CRTPPacket pk;
+  memset(&pk, 0, sizeof(pk));
+
   for (uint16_t i = 0; i < sample_count; i++) {
     pk.port = CRTP_PORT_BULK;
     pk.channel = BULK_CHAN_DATA;
@@ -204,15 +226,23 @@ static void sendRecording(void) {
     pk.data[0] = i & 0xff;
     pk.data[1] = (i >> 8) & 0xff;
     memcpy(&pk.data[2], &flight_log[i], sizeof(FlightSample));
-    crtpSendPacketBlock(&pk);
+    if (!sendPacketBounded(&pk)) {
+      DEBUG_PRINT("CAVEBAT: send stalled at sample %d, aborting\n", (int)i);
+      return;   // no EOF: the app times out and keeps what arrived
+    }
+    // Pace the transfer. Filling the radio queue as fast as this loop can is
+    // what makes it stall in the first place.
+    vTaskDelay(M2T(5));
   }
+
+  memset(&pk, 0, sizeof(pk));
   pk.port = CRTP_PORT_BULK;
   pk.channel = BULK_CHAN_CTRL;
   pk.size = 3;
   pk.data[0] = CMD_EOF;
   pk.data[1] = sample_count & 0xff;
   pk.data[2] = (sample_count >> 8) & 0xff;
-  crtpSendPacketBlock(&pk);
+  sendPacketBounded(&pk);
   DEBUG_PRINT("CAVEBAT: send complete\n");
 }
 

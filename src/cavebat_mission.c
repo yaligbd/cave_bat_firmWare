@@ -130,6 +130,17 @@ static float safeLogFloat(logVarId_t id) {
 // cave survey needs. Position stays full-resolution millimetres.
 typedef struct __attribute__((packed)) {
   int16_t x, y, z;                              // position, mm
+  // Which way the drone was pointing, in whole degrees, -180..180.
+  //
+  // Without this the six ranges cannot be placed on a map. "Front says 800mm"
+  // means nothing on its own once the drone can turn -- it is 800mm north on
+  // one sample and 800mm east two seconds later. The path was always drawable
+  // from position alone, which is why this was not needed while yaw was pinned
+  // at zero; the walls never were.
+  //
+  // Two bytes takes the sample to 14 and the download packet to 17, still
+  // inside the 19 that fits one BLE notification.
+  int16_t yaw;
   uint8_t front, back, left, right, up, down;   // ranges, 2cm units, 0 = none
 } FlightSample;
 
@@ -216,6 +227,66 @@ static uint32_t mission_walldist = 400;
 // Step speed, m/s. Matches the climb rate the takeoff already uses.
 #define STEP_SPEED_MS    0.3f
 
+// --- Turning ---------------------------------------------------------------
+//
+// The first flying version held yaw at zero and strafed, which followed a wall
+// that curved gently and gave up at a corner. Following walls "even if they
+// turn left or right, inwards or outwards" needs the drone to actually turn,
+// so it now steers with its heading the way a person walking a wall would.
+//
+// Three cases cover every corner:
+//
+//   wall ahead            -> the wall turns AWAY from the drone's right, an
+//                            inward corner. Rotate left, on the spot, until
+//                            the way ahead is clear.
+//   wall gone on the right-> the wall turned out from under it, an outward
+//                            corner. Rotate right and edge forward to come
+//                            around it.
+//   wall there but wrong  -> trim the heading in proportion to the error and
+//     distance               keep flying. This is what tracks a curve.
+//
+// Rotating on the spot at a corner rather than while moving is deliberate: it
+// keeps translation and rotation from being commanded at once, which is where
+// a stepping controller would get untidy.
+
+// Degrees turned per step at a corner. Small enough that the drone re-reads
+// its sensors several times through a right angle instead of committing to
+// the whole turn on one reading.
+#define TURN_IN_DEG      30.0f
+#define TURN_OUT_DEG     25.0f
+
+// The most the heading may be trimmed on a following step, and how hard to
+// trim per millimetre of error. 200mm off target gives 15 degrees, so the
+// drone converges over a few steps rather than swinging back and forth.
+#define MAX_TRIM_DEG     20.0f
+#define TRIM_DEG_PER_MM  0.075f
+
+// Beyond this the wall on the right has gone, and the drone treats it as an
+// outward corner rather than as a wall it is merely far from. Sits above
+// WALL_MAX_MM so ordinary drift does not read as a corner.
+#define WALL_LOST_MM    1400
+
+// How far to creep forward while coming around an outward corner. Shorter than
+// a normal step, because the drone is turning into space it cannot see yet.
+#define STEP_CORNER_MM   150
+
+#define DEG2RAD          0.017453292f
+#define RAD2DEG          57.29578f
+
+// The heading the drone is being flown at, radians. Tracked rather than read
+// back, because this is the value being COMMANDED -- reading the estimate and
+// steering from it would feed the estimator's own error back into the
+// controller.
+static float mission_yaw = 0.0f;
+
+// Keep a heading in -pi..pi so it can be stored in an int16 of degrees and so
+// repeated turning in one direction never runs away.
+static float wrapYaw(float y) {
+  while (y >  3.14159265f) y -= 6.28318531f;
+  while (y < -3.14159265f) y += 6.28318531f;
+  return y;
+}
+
 // A step that has not reported finished by this long past its planned duration
 // is treated as finished anyway. Without it, one goTo that never completes
 // would strand the drone in the air until the timer ran out.
@@ -241,6 +312,12 @@ static uint8_t tele_phase = PHASE_IDLE;
 //   0 = still going  1 = half the timer elapsed  2 = geofence
 //   3 = blocked ahead with nowhere to go  4 = out of breadcrumb space
 static uint8_t tele_outwhy = 0;
+
+// The commanded heading in whole degrees, published so the phone-side recorder
+// can capture it too. The drone's own recording carries yaw in every sample;
+// without this the phone's copy of the same flight would still draw all its
+// walls facing one way, and the two recordings of one flight would disagree.
+static int16_t tele_yaw = 0;
 
 // The step currently in the air, if any.
 static bool       step_active = false;
@@ -268,7 +345,7 @@ static bool beyondGeofence(void) {
 // is; over dozens of steps that difference accumulates and the breadcrumb
 // trail stops matching the flight. Every target here is computed from the
 // estimated position and sent in world coordinates.
-static void issueStep(float tx_m, float ty_m, float tz_m) {
+static void issueStep(float tx_m, float ty_m, float tz_m, float yaw_rad) {
   float dx = tx_m - (tele_x / 1000.0f);
   float dy = ty_m - (tele_y / 1000.0f);
   float dist = sqrtf(dx * dx + dy * dy);
@@ -280,8 +357,18 @@ static void issueStep(float tx_m, float ty_m, float tz_m) {
   // place it was never at. Capping the duration caps how far a single bad
   // reading can carry it before the sensors are consulted again.
   if (dur > 4.0f) dur = 4.0f;
+  // Turning on the spot covers no distance, so the distance-derived duration
+  // would be the 0.7s floor no matter how far it has to rotate. Give a turn
+  // time proportional to its size instead, or the commander is asked to snap
+  // round faster than the aircraft can follow.
+  float dyaw = wrapYaw(yaw_rad - mission_yaw);
+  if (dyaw < 0) dyaw = -dyaw;
+  float turn_dur = dyaw * RAD2DEG / 45.0f;   // 45 deg/s, unhurried
+  if (turn_dur > dur) dur = turn_dur;
+  if (dur > 4.0f) dur = 4.0f;
+  mission_yaw = wrapYaw(yaw_rad);
 
-  crtpCommanderHighLevelGoTo(tx_m, ty_m, tz_m, 0.0f, dur, false);
+  crtpCommanderHighLevelGoTo(tx_m, ty_m, tz_m, yaw_rad, dur, false);
   step_active   = true;
   step_deadline = xTaskGetTickCount()
                 + M2T((uint32_t)(dur * 1000.0f)) + M2T(STEP_GRACE_MS);
@@ -432,6 +519,7 @@ void appMain(void) {
     tele_right = clampRange(safeLogFloat(idRight));
     tele_up    = clampRange(safeLogFloat(idUp));
     tele_down  = clampRange(safeLogFloat(idDown));
+    tele_yaw   = (int16_t)(mission_yaw * RAD2DEG);
     tele_x     = (int16_t)(safeLogFloat(idX) * 1000.0f);
     tele_y     = (int16_t)(safeLogFloat(idY) * 1000.0f);
     tele_z     = (int16_t)(safeLogFloat(idZ) * 1000.0f);
@@ -457,6 +545,7 @@ void appMain(void) {
       if (sample_count < MAX_SAMPLES) {
         FlightSample *fs = &flight_log[sample_count];
         fs->x = tele_x;  fs->y = tele_y;  fs->z = tele_z;
+        fs->yaw = (int16_t)(mission_yaw * RAD2DEG);
         fs->front = rangeTo2cm(tele_front);
         fs->back  = rangeTo2cm(tele_back);
         fs->left  = rangeTo2cm(tele_left);
@@ -561,6 +650,10 @@ void appMain(void) {
         tele_endwhy = 0;
         tele_phase = PHASE_CLIMB;
         tele_outwhy = 0;
+        // Whatever way the drone is physically pointing becomes zero. Every
+        // heading in the mission is relative to how it was placed, which is
+        // what a pilot expects and what the estimator assumes.
+        mission_yaw = 0.0f;
         waypoint_count = 0;
         step_active = false;
         climb_done_tick = xTaskGetTickCount()
@@ -662,55 +755,68 @@ void appMain(void) {
                 } else {
                     // --- Decide one step ---------------------------------
                     //
-                    // Fixed yaw, so this is all in world axes: +X is the way
-                    // the drone faces, +Y is its left, -Y its right. The wall
-                    // being followed is on the RIGHT.
+                    // The drone steers rather than strafes, so everything here
+                    // is relative to where it is currently pointing. Forward
+                    // in the world is (cos yaw, sin yaw); the wall is on the
+                    // right, which is 90 degrees clockwise from that.
                     float cx = tele_x / 1000.0f;
                     float cy = tele_y / 1000.0f;
                     float cz = mission_height / 1000.0f;
-                    float nx = cx, ny = cy;
 
                     uint16_t f = tele_front;
                     uint16_t r = tele_right;
-                    uint16_t l = tele_left;
 
-                    bool frontBlocked = (f > 0) && (f < FRONT_STOP_MM);
+                    float newYaw = mission_yaw;
+                    float advance = 0.0f;   // metres along the NEW heading
 
-                    if (frontBlocked) {
-                        // Something across the path. With yaw fixed the drone
-                        // cannot turn to follow it round, so it sidesteps left
-                        // if there is room and gives up if there is not. Giving
-                        // up means going home, not stopping in mid-air.
-                        bool leftClear = (l == 0) || (l > (FRONT_STOP_MM + STEP_SIDE_MM));
-                        if (leftClear) {
-                            ny = cy + (STEP_SIDE_MM / 1000.0f);
+                    if ((f > 0) && (f < FRONT_STOP_MM)) {
+                        // INWARD CORNER. The wall has turned across the path,
+                        // so the way on is to the left. Rotate on the spot and
+                        // look again -- several small turns through a right
+                        // angle, each one re-read, rather than one blind 90.
+                        newYaw = wrapYaw(mission_yaw + TURN_IN_DEG * DEG2RAD);
+                        advance = 0.0f;
+                        DEBUG_PRINT("CAVEBAT: corner in, f=%d, turning left\n", (int)f);
+
+                    } else if ((r == 0) || (r > WALL_LOST_MM)) {
+                        // OUTWARD CORNER, or no wall found yet.
+                        //
+                        // These are the same manoeuvre. If the drone was
+                        // following a wall and it vanished, the wall turned
+                        // away and the drone follows it round by turning right
+                        // and creeping forward. If it never had a wall, it is
+                        // searching, and turning right while advancing sweeps
+                        // for one instead of flying in a straight line past it.
+                        if (waypoint_count > 1) {
+                            newYaw = wrapYaw(mission_yaw - TURN_OUT_DEG * DEG2RAD);
+                            advance = STEP_CORNER_MM / 1000.0f;
+                            DEBUG_PRINT("CAVEBAT: corner out, r gone, turning right\n");
                         } else {
-                            tele_outwhy = 3;
-                            DEBUG_PRINT("CAVEBAT: blocked f=%d l=%d, returning\n",
-                                        (int)f, (int)l);
-                            tele_phase = PHASE_RETURN;
+                            // Nothing found yet and nowhere to turn back to.
+                            // Fly straight and keep looking.
+                            advance = STEP_FWD_MM / 1000.0f;
                         }
-                    } else if ((r > 0) && (r < WALL_MAX_MM)) {
-                        // Following. Hold mission_walldist from the wall, and
-                        // only correct outside the deadband so sensor noise
-                        // does not turn the path into a zigzag.
-                        int32_t err = (int32_t)r - (int32_t)mission_walldist;
-                        if (err > WALL_BAND_MM) {
-                            ny = cy - (STEP_SIDE_MM / 1000.0f);   // drifted off, close in
-                        } else if (err < -WALL_BAND_MM) {
-                            ny = cy + (STEP_SIDE_MM / 1000.0f);   // too close, back off
-                        }
-                        nx = cx + (STEP_FWD_MM / 1000.0f);
+
                     } else {
-                        // No wall within range on the right yet. Fly forward
-                        // and keep looking; this is the search that opens the
-                        // mission.
-                        nx = cx + (STEP_FWD_MM / 1000.0f);
+                        // FOLLOWING. Trim the heading in proportion to how far
+                        // off the target distance the wall is, then fly on.
+                        // Too far from the wall turns toward it (right, which
+                        // is a negative yaw change); too close turns away.
+                        //
+                        // Proportional rather than fixed so a gentle curve gets
+                        // a gentle correction. A fixed step would make the
+                        // drone saw back and forth along a straight wall.
+                        float err = (float)r - (float)mission_walldist;
+                        float trim = -err * TRIM_DEG_PER_MM;
+                        if (trim >  MAX_TRIM_DEG) trim =  MAX_TRIM_DEG;
+                        if (trim < -MAX_TRIM_DEG) trim = -MAX_TRIM_DEG;
+                        newYaw = wrapYaw(mission_yaw + trim * DEG2RAD);
+                        advance = STEP_FWD_MM / 1000.0f;
                     }
 
-                    if (tele_phase == PHASE_OUTBOUND) {
-                        issueStep(nx, ny, cz);
-                    }
+                    float nx = cx + advance * cosf(newYaw);
+                    float ny = cy + advance * sinf(newYaw);
+                    issueStep(nx, ny, cz, newYaw);
                 }
             }
 
@@ -731,9 +837,17 @@ void appMain(void) {
                     tele_phase = PHASE_LANDING;
                 } else {
                     return_index--;
+                    // Heading held, not recomputed. The drone is retracing
+                    // space it has just flown through, so there is nothing to
+                    // look at that it has not already seen, and holding the
+                    // heading keeps rotation out of the return entirely. It
+                    // flies home sideways or backwards, which the aircraft
+                    // does perfectly well, and every sample still carries the
+                    // heading so the map stays correct.
                     issueStep(waypoints[return_index].x / 1000.0f,
                               waypoints[return_index].y / 1000.0f,
-                              mission_height / 1000.0f);
+                              mission_height / 1000.0f,
+                              mission_yaw);
                 }
             }
         }
@@ -906,6 +1020,7 @@ LOG_GROUP_START(tele)
   // Why the outbound leg ended:
   // 0 still going, 1 half the timer, 2 geofence, 3 blocked, 4 trail full.
   LOG_ADD(LOG_UINT8,  outwhy, &tele_outwhy)
+  LOG_ADD(LOG_INT16,  yaw,    &tele_yaw)
   LOG_ADD(LOG_UINT16, vbat,  &tele_vbat)
   LOG_ADD(LOG_UINT16, front, &tele_front)
   LOG_ADD(LOG_UINT16, back,  &tele_back)

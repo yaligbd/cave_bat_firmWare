@@ -160,165 +160,90 @@ static uint8_t rangeTo2cm(uint16_t mm) {
 
 
 // ============================================================================
-// WALL FOLLOWING AND THE RETURN LEG
+// WALL FOLLOWING - SETTINGS
 // ============================================================================
+// Mission: take off, follow a wall on the RIGHT for half the timer, fly back
+// along the same route, land. Records the whole time.
 //
-// This is the full life cycle: take off, find a wall, follow it out for half
-// the timer, then retrace the route home and land, recording throughout.
-//
-// THREE DECISIONS, ALL MADE FOR SAFETY OVER ELEGANCE
-//
-// 1. The high-level commander does EVERYTHING. No velocity setpoints anywhere.
-//    Wall following moves in discrete goTo steps and waits for each to finish.
-//    A previous attempt at wall following swapped in velocity setpoints, and
-//    the drone flipped on takeoff with four changes in flight at once and no
-//    way to tell which was at fault. Stepping is less smooth than velocity
-//    control and it does not matter: the drone samples once a second, and
-//    holding still between steps makes those samples better, not worse.
-//
-// 2. Yaw stays at zero for the entire flight. The drone never rotates; it
-//    strafes. That makes the body frame and the world frame the same thing, so
-//    "front" really is +X and "right" really is -Y, the recorded path needs no
-//    rotation to be drawn, and the return leg is exact.
-//
-//    The cost is real and worth stating plainly: a drone that cannot turn
-//    cannot round a ninety-degree corner. It follows a wall that curves or
-//    slants, and ends the outbound leg at one that cuts across it. For a first
-//    flying version that is the right trade, and turning can be added later
-//    against a baseline that works.
-//
-// 3. Breadcrumbs, not dead reckoning. Every completed step records where the
-//    drone actually ended up, and the return flies those points in reverse.
-//    "Retrace the route" is then literally what happens.
-//
-// WALL FOLLOWING IS OFF BY DEFAULT (mission.wallfollow = 0)
-//
-// With it off this firmware flies exactly like the version before it: take
-// off, hover out the timer, land. So flashing this cannot regress a working
-// drone -- verify the hover still works, THEN turn wall following on.
+// How it moves: small hops ("steps") using goTo, never continuous speed
+// commands. Each hop: read sensors, decide, move, wait until it arrives.
+// Home: every hop drops a "breadcrumb" (its position). Going home = visiting
+// the breadcrumbs in reverse.
 
-// 0 = hover in place for the timer, as before. 1 = seek and follow a wall.
+// 0 = just hover (like before). 1 = follow a wall. Set by the app.
 static uint8_t mission_wallfollow = 0;
 
-// Distance to hold from the wall, in mm, and how far it may drift before the
-// drone corrects. A deadband matters: without one it strafes on every single
-// step chasing sensor noise, and the path comes out as a zigzag.
+// Distance to keep from the wall, mm. Set by the app.
 static uint32_t mission_walldist = 400;
+
+// --- Not used any more (left over from the older sideways-only version) ----
 #define WALL_BAND_MM     120
-
-// Beyond this a "wall" is too far to be the one we are following. The
-// multiranger reads to about 3m; anything past 1.2m is the far side of a room,
-// not the surface we are tracking.
 #define WALL_MAX_MM     1200
+// ----------------------------------------------------------------------------
 
-// How far to move per step, forward and sideways. Small steps mean the drone
-// re-reads its sensors often and can never commit far to a bad decision.
+// Size of one forward hop, mm.
 #define STEP_FWD_MM      200
-#define STEP_SIDE_MM     150
+#define STEP_SIDE_MM     150   // not used any more
 
-// Something this close ahead stops the outbound leg advancing.
+// Something this close IN FRONT = inside corner, turn left.
 #define FRONT_STOP_MM    500
 
-// GEOFENCE. The single most important number here. However confused the wall
-// following gets, the drone turns for home once it is this far from where it
-// started. Straight-line distance from the origin, in mm.
+// SAFETY: this far from the takeoff spot = stop and fly home. mm.
 #define GEOFENCE_MM     4000
 
-// Step speed, m/s. Matches the climb rate the takeoff already uses.
-// Slowed from 0.3. Every metre now gets half as much again in sensor readings
-// and gives the estimator more time to keep up, and nothing about this mission
-// benefits from being quick.
+// Hop speed, m/s. Slow on purpose: more sensor readings per metre.
 #define STEP_SPEED_MS    0.2f
 
-// --- Turning ---------------------------------------------------------------
-//
-// The first flying version held yaw at zero and strafed, which followed a wall
-// that curved gently and gave up at a corner. Following walls "even if they
-// turn left or right, inwards or outwards" needs the drone to actually turn,
-// so it now steers with its heading the way a person walking a wall would.
-//
-// Three cases cover every corner:
-//
-//   wall ahead            -> the wall turns AWAY from the drone's right, an
-//                            inward corner. Rotate left, on the spot, until
-//                            the way ahead is clear.
-//   wall gone on the right-> the wall turned out from under it, an outward
-//                            corner. Rotate right and edge forward to come
-//                            around it.
-//   wall there but wrong  -> trim the heading in proportion to the error and
-//     distance               keep flying. This is what tracks a curve.
-//
-// Rotating on the spot at a corner rather than while moving is deliberate: it
-// keeps translation and rotation from being commanded at once, which is where
-// a stepping controller would get untidy.
+// --- Turning ----------------------------------------------------------------
+// The drone steers like a person walking along a wall:
+//   wall ahead          -> inside corner  -> turn left on the spot
+//   wall on right gone  -> outside corner -> turn right on the spot
+//   wall there          -> small steering fix to keep the distance, fly on
 
-// Degrees turned per step at a corner. Small enough that the drone re-reads
-// its sensors several times through a right angle instead of committing to
-// the whole turn on one reading.
+// Degrees turned per hop at a corner. Small, so it re-checks during a turn.
 #define TURN_IN_DEG      25.0f
 #define TURN_OUT_DEG     20.0f
 
-// A corner turn is only believed after this many decisions in a row agree.
-// Turning right means turning TOWARD the wall, so it is held to the stricter
-// count: the cost of a wrong left turn is a wasted step, the cost of a wrong
-// right turn is the wall.
+// How many decisions in a row must agree before turning at a corner.
+// Right turns (toward the wall) need more proof than left turns.
 #define CONFIRM_IN       2
 #define CONFIRM_OUT      3
 static uint8_t confirm_in = 0;
 static uint8_t confirm_out = 0;
 
-// The most the heading may be trimmed on a following step, and how hard to
-// trim per millimetre of error. 200mm off target gives 15 degrees, so the
-// drone converges over a few steps rather than swinging back and forth.
-// Halved from 20. At 20 degrees a single reading 400mm off target swung the
-// drone a fifth of a right angle, and with the wall only 400mm away there is
-// no room for a correction that large to be wrong.
+// Steering fix while following: at most 10 degrees per hop,
+// 0.04 degrees for every mm the drone is off the target distance.
 #define MAX_TRIM_DEG     10.0f
 #define TRIM_DEG_PER_MM  0.04f
 
-// Closer than this to the wall is an emergency, and the only allowed response
-// is to turn away from it. No reading, however confident, may turn the drone
-// toward a wall this close.
+// SAFETY: wall on the right closer than this = turn away, no matter what.
 #define WALL_PANIC_MM    220
 
-// Beyond this the wall on the right has gone, and the drone treats it as an
-// outward corner rather than as a wall it is merely far from. Sits above
-// WALL_MAX_MM so ordinary drift does not read as a corner.
+// Wall on the right farther than this = it's gone (outside corner).
 #define WALL_LOST_MM    1400
 
-// How far to creep forward while coming around an outward corner. Shorter than
-// a normal step, because the drone is turning into space it cannot see yet.
-#define STEP_CORNER_MM   150
+#define STEP_CORNER_MM   150   // not used any more
 
+// Unit conversions: degrees <-> radians.
 #define DEG2RAD          0.017453292f
 #define RAD2DEG          57.29578f
 
-// The heading the drone is being flown at, radians. Tracked rather than read
-// back, because this is the value being COMMANDED -- reading the estimate and
-// steering from it would feed the estimator's own error back into the
-// controller.
+// Which way the drone is being told to face, in radians. 0 = the way it
+// faced at takeoff.
 static float mission_yaw = 0.0f;
 
-// Keep a heading in -pi..pi so it can be stored in an int16 of degrees and so
-// repeated turning in one direction never runs away.
-// Steering decisions are made from a MEDIAN of recent readings, never from one.
-//
-// This is why wall following flew into the wall. Every decision came from a
-// single instantaneous reading and could command up to 25 degrees of turn, and
-// a VL53L1x returns 0 both for "nothing in range" and for a read that simply
-// failed. One failed read on the right-hand sensor was therefore indis-
-// tinguishable from the wall ending, and the response to the wall ending is to
-// turn RIGHT -- into the wall. Two or three of those in a row and the drone is
-// pointed at the wall and flying.
-//
-// A median of five throws away any pair of outliers outright. It costs half a
-// second of history, which is nothing against a step that takes about one.
+// --- Sensor smoothing -------------------------------------------------------
+// Decisions use the MEDIAN of the last 5 readings, never one reading.
+// Why: a sensor sometimes returns 0 by mistake, and 0 on the right sensor
+// means "wall gone" -> turn toward the wall. One glitch could fly the drone
+// into the wall. The median throws glitches away.
 #define RANGE_HIST 5
 static uint16_t hist_front[RANGE_HIST];
 static uint16_t hist_right[RANGE_HIST];
 static uint8_t  hist_pos = 0;
 static uint8_t  hist_fill = 0;
 
+// Add the newest front and right readings to the history.
 static void pushRanges(uint16_t f, uint16_t r) {
   hist_front[hist_pos] = f;
   hist_right[hist_pos] = r;
@@ -326,6 +251,7 @@ static void pushRanges(uint16_t f, uint16_t r) {
   if (hist_fill < RANGE_HIST) hist_fill++;
 }
 
+// Return the middle value of the history (sort a copy, take the middle).
 static uint16_t medianOf(const uint16_t *buf) {
   uint16_t t[RANGE_HIST];
   uint8_t n = hist_fill;
@@ -339,54 +265,36 @@ static uint16_t medianOf(const uint16_t *buf) {
   return n ? t[n / 2] : 0;
 }
 
+// Keep an angle between -180 and +180 degrees (in radians), so turning the
+// same way many times never grows the number forever.
 static float wrapYaw(float y) {
   while (y >  3.14159265f) y -= 6.28318531f;
   while (y < -3.14159265f) y += 6.28318531f;
   return y;
 }
 
-// A step that has not reported finished by this long past its planned duration
-// is treated as finished anyway. Without it, one goTo that never completes
-// would strand the drone in the air until the timer ran out.
+// SAFETY: if a hop hasn't finished this long after it should have, move on
+// anyway. Stops one stuck hop from leaving the drone hanging in the air.
 #define STEP_GRACE_MS    1500
 
-// Hold still for this long after a turn before flying anywhere.
-//
-// This is the one difference between the flights that work and the flights
-// that do not. Hover has not crashed in a long time; wall following crashes
-// about half the time. Hover never turns. Wall following turns.
-//
-// The Flow deck measures optical flow, and rotating over a floor produces
-// apparent translation that the estimator has to unpick using the gyro. For a
-// moment after a turn its position estimate is at its least trustworthy -- and
-// the old code commanded the next translation immediately, from exactly that
-// estimate. Every target is computed as "where I am, plus a step", so a
-// position estimate disturbed by rotation sends the drone to the wrong place
-// at speed.
-//
-// Standing still costs a second and lets the flow measurement settle before it
-// is trusted again. Not proven: no log of a crash was ever captured, so this
-// is reasoning from what distinguishes the two cases, not from a recording of
-// one going wrong.
+// --- Pause after turning (NEW - never flown, not in v11) --------------------
+// After a turn bigger than 8 degrees, hover still for 1 second before the
+// next hop. Idea: turning confuses the floor camera for a moment, so let it
+// settle first. A guess, not proven - no crash was ever caught in a log.
 #define TURN_SETTLE_MS   1000
-
-// A yaw change smaller than this is a trim, not a turn, and does not need the
-// settle. Otherwise every following step would pause and the drone would take
-// all day to get anywhere.
 #define TURN_SETTLE_DEG  8.0f
 
 static TickType_t settle_until = 0;
 static float last_turn_deg = 0.0f;
 
-// Breadcrumbs. 64 covers a 60-second outbound leg at roughly a step a second,
-// with room to spare, for 256 bytes of RAM.
+// --- Breadcrumbs --------------------------------------------------------------
+// One saved position per hop. 64 is enough for about a minute of flying out.
 #define MAX_WAYPOINTS 64
 typedef struct { int16_t x, y; } Waypoint;
 static Waypoint waypoints[MAX_WAYPOINTS];
 static uint16_t waypoint_count = 0;
 
-// Mission phases. Published as tele.phase so the app can say what the drone is
-// doing rather than only whether it is flying.
+// --- Mission phase (the app can read this) ----------------------------------
 #define PHASE_IDLE      0
 #define PHASE_CLIMB     1
 #define PHASE_OUTBOUND  2
@@ -394,18 +302,15 @@ static uint16_t waypoint_count = 0;
 #define PHASE_LANDING   4
 static uint8_t tele_phase = PHASE_IDLE;
 
-// Why the outbound leg ended, published for the same reason.
-//   0 = still going  1 = half the timer elapsed  2 = geofence
-//   3 = blocked ahead with nowhere to go  4 = out of breadcrumb space
+// Why the drone stopped going out and turned home (the app can read this):
+//   0 = still going  1 = half the timer  2 = geofence
+//   3 = blocked      4 = out of breadcrumbs
 static uint8_t tele_outwhy = 0;
 
-// The commanded heading in whole degrees, published so the phone-side recorder
-// can capture it too. The drone's own recording carries yaw in every sample;
-// without this the phone's copy of the same flight would still draw all its
-// walls facing one way, and the two recordings of one flight would disagree.
+// Current heading in whole degrees, for the app.
 static int16_t tele_yaw = 0;
 
-// The step currently in the air, if any.
+// The hop currently in progress, if any, and its time limits.
 static bool       step_active = false;
 static TickType_t step_deadline = 0;
 static TickType_t outbound_deadline = 0;

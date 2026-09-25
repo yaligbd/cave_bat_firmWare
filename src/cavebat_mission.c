@@ -170,8 +170,20 @@ static uint8_t rangeTo2cm(uint16_t mm) {
 // Home: every hop drops a "breadcrumb" (its position). Going home = visiting
 // the breadcrumbs in reverse.
 
-// 0 = just hover (like before). 1 = follow a wall. Set by the app.
+// Flight mode, set by the app.
+//   0 = hover in place (unchanged behaviour)
+//   1 = follow a wall on the RIGHT
+//   2 = follow a wall on the LEFT
+//
+// Left following is the exact mirror of right following, not a second copy of
+// the logic. One sign variable flips every turn and every steering correction,
+// so a fix to one is automatically a fix to the other and the two cannot drift
+// apart.
 static uint8_t mission_wallfollow = 0;
+
+// +1 when following the wall on the right, -1 when following it on the left.
+// Multiplying every yaw change by this mirrors the whole controller.
+static float follow_sign = 1.0f;
 
 // Distance to keep from the wall, mm. Set by the app.
 static uint32_t mission_walldist = 400;
@@ -240,13 +252,15 @@ static float mission_yaw = 0.0f;
 #define RANGE_HIST 5
 static uint16_t hist_front[RANGE_HIST];
 static uint16_t hist_right[RANGE_HIST];
+static uint16_t hist_left[RANGE_HIST];
 static uint8_t  hist_pos = 0;
 static uint8_t  hist_fill = 0;
 
-// Add the newest front and right readings to the history.
-static void pushRanges(uint16_t f, uint16_t r) {
+// Add the newest front, right and left readings to the history.
+static void pushRanges(uint16_t f, uint16_t r, uint16_t l) {
   hist_front[hist_pos] = f;
   hist_right[hist_pos] = r;
+  hist_left[hist_pos]  = l;
   hist_pos = (uint8_t)((hist_pos + 1) % RANGE_HIST);
   if (hist_fill < RANGE_HIST) hist_fill++;
 }
@@ -514,7 +528,7 @@ void appMain(void) {
     tele_yaw   = (int16_t)(mission_yaw * RAD2DEG);
     // Sampled at the full 10Hz loop rate rather than once per step, so a step
     // that lasts a second is decided on ten readings instead of one.
-    pushRanges(tele_front, tele_right);
+    pushRanges(tele_front, tele_right, tele_left);
     tele_x     = (int16_t)(safeLogFloat(idX) * 1000.0f);
     tele_y     = (int16_t)(safeLogFloat(idY) * 1000.0f);
     tele_z     = (int16_t)(safeLogFloat(idZ) * 1000.0f);
@@ -649,6 +663,9 @@ void appMain(void) {
         // heading in the mission is relative to how it was placed, which is
         // what a pilot expects and what the estimator assumes.
         mission_yaw = 0.0f;
+        // Right-hand following turns one way at a corner, left-hand following
+        // turns the other. Fixed once here rather than tested at every branch.
+        follow_sign = (mission_wallfollow == 2) ? -1.0f : 1.0f;
         confirm_in = 0;
         confirm_out = 0;
         hist_pos = 0;
@@ -707,7 +724,8 @@ void appMain(void) {
                                       + M2T((mission_timer * 1000) / 2);
                     // Where we started, so the trail always ends at the pad.
                     dropBreadcrumb();
-                    DEBUG_PRINT("CAVEBAT: outbound, wall following\n");
+                    DEBUG_PRINT("CAVEBAT: outbound, following wall on the %s\n",
+                                mission_wallfollow == 2 ? "LEFT" : "RIGHT");
                 } else {
                     // Wall following off: behave exactly as the previous
                     // firmware did. Hover until the timer expires.
@@ -768,8 +786,14 @@ void appMain(void) {
                     //
                     // The drone steers rather than strafes, so everything here
                     // is relative to where it is currently pointing. Forward in
-                    // the world is (cos yaw, sin yaw); the wall is on the
-                    // right, 90 degrees clockwise from that.
+                    // the world is (cos yaw, sin yaw).
+                    //
+                    // RIGHT and LEFT following are the same controller. The
+                    // only differences are which sensor is read and which way
+                    // each turn goes, so the sensor is picked once into `side`
+                    // and every yaw change is multiplied by follow_sign. With
+                    // follow_sign = +1 this is exactly the right-hand follower
+                    // that flew; with -1 it is its mirror image.
                     //
                     // Every reading used here is a MEDIAN of the last half
                     // second, never a single sample. The first version steered
@@ -781,15 +805,17 @@ void appMain(void) {
                     float cy = tele_y / 1000.0f;
                     float cz = mission_height / 1000.0f;
 
-                    uint16_t f = medianOf(hist_front);
-                    uint16_t r = medianOf(hist_right);
+                    uint16_t f    = medianOf(hist_front);
+                    uint16_t side = (mission_wallfollow == 2)
+                                      ? medianOf(hist_left)
+                                      : medianOf(hist_right);
 
                     float newYaw = mission_yaw;
                     float advance = 0.0f;   // metres along the NEW heading
 
                     bool frontClose = (f > 0) && (f < FRONT_STOP_MM);
-                    bool wallGone   = (r == 0) || (r > WALL_LOST_MM);
-                    bool tooClose   = (r > 0) && (r < WALL_PANIC_MM);
+                    bool wallGone   = (side == 0) || (side > WALL_LOST_MM);
+                    bool tooClose   = (side > 0) && (side < WALL_PANIC_MM);
 
                     // Streaks, so one odd decision cannot turn the aircraft.
                     if (frontClose) confirm_in++;  else confirm_in = 0;
@@ -800,41 +826,42 @@ void appMain(void) {
                         // wall detected ahead, because whatever else is true
                         // the drone is about to touch the thing it is
                         // following. Turn away, do not advance.
-                        newYaw = wrapYaw(mission_yaw + TURN_IN_DEG * DEG2RAD);
+                        newYaw = wrapYaw(mission_yaw + follow_sign * TURN_IN_DEG * DEG2RAD);
                         advance = 0.0f;
                         confirm_in = 0;
                         confirm_out = 0;
-                        DEBUG_PRINT("CAVEBAT: too close r=%d, turning away\n", (int)r);
+                        DEBUG_PRINT("CAVEBAT: too close %d, turning away\n", (int)side);
 
                     } else if (confirm_in >= CONFIRM_IN) {
                         // INWARD CORNER. The wall has turned across the path,
-                        // so the way on is to the left. Rotate on the spot and
+                        // so the way on is away from it. Rotate on the spot and
                         // look again -- several small turns through a right
                         // angle, each re-read, rather than one blind ninety.
-                        newYaw = wrapYaw(mission_yaw + TURN_IN_DEG * DEG2RAD);
+                        newYaw = wrapYaw(mission_yaw + follow_sign * TURN_IN_DEG * DEG2RAD);
                         advance = 0.0f;
-                        DEBUG_PRINT("CAVEBAT: corner in, f=%d, turning left\n", (int)f);
+                        DEBUG_PRINT("CAVEBAT: corner in, f=%d\n", (int)f);
 
                     } else if (confirm_out >= CONFIRM_OUT && waypoint_count > 1) {
                         // OUTWARD CORNER. The wall turned away from under the
-                        // drone, so it follows it round by turning right.
+                        // drone, so it follows it round by turning toward where
+                        // the wall used to be.
                         //
-                        // Turning right means turning TOWARD where the wall
-                        // was, which is the one turn that can end in a
-                        // collision, so it needs three agreeing decisions and
-                        // it does not advance while turning. The step after
-                        // this one either finds the wall again and resumes
-                        // following, or turns again.
-                        newYaw = wrapYaw(mission_yaw - TURN_OUT_DEG * DEG2RAD);
+                        // That is the one turn that can end in a collision, so
+                        // it needs three agreeing decisions and it does not
+                        // advance while turning. The step after this one either
+                        // finds the wall again and resumes following, or turns
+                        // again.
+                        newYaw = wrapYaw(mission_yaw - follow_sign * TURN_OUT_DEG * DEG2RAD);
                         advance = 0.0f;
-                        DEBUG_PRINT("CAVEBAT: corner out, turning right\n");
+                        DEBUG_PRINT("CAVEBAT: corner out\n");
 
                     } else if (wallGone) {
-                        // No wall on the right, and not yet confirmed as a
-                        // corner. Hold the heading and fly on. This is both the
-                        // search that opens the mission and the safe answer to
-                        // a single dropped reading: carrying straight on cannot
-                        // put the drone into a wall it has lost track of.
+                        // No wall on the followed side, and not yet confirmed
+                        // as a corner. Hold the heading and fly on. This is
+                        // both the search that opens the mission and the safe
+                        // answer to a single dropped reading: carrying straight
+                        // on cannot fly the drone into a wall it has lost
+                        // track of.
                         advance = STEP_FWD_MM / 1000.0f;
 
                     } else {
@@ -845,8 +872,8 @@ void appMain(void) {
                         // Proportional so a gentle curve gets a gentle
                         // correction, and capped hard: with the wall 400mm away
                         // there is no room for a large correction to be wrong.
-                        float err = (float)r - (float)mission_walldist;
-                        float trim = -err * TRIM_DEG_PER_MM;
+                        float err = (float)side - (float)mission_walldist;
+                        float trim = -follow_sign * err * TRIM_DEG_PER_MM;
                         if (trim >  MAX_TRIM_DEG) trim =  MAX_TRIM_DEG;
                         if (trim < -MAX_TRIM_DEG) trim = -MAX_TRIM_DEG;
                         newYaw = wrapYaw(mission_yaw + trim * DEG2RAD);
@@ -942,14 +969,13 @@ void appMain(void) {
                 obstacle_streak = 0;
             } else if ((int32_t)(xTaskGetTickCount() - climb_done_tick) < 0) {
                 obstacle_streak = 0;
+            // The sensor pointed at the wall being followed is excluded,
+            // because being close to that wall IS the mission. Left in, this
+            // guard would abort every successful wall follow the moment it
+            // started working. The other three sides still count.
             } else if (sideBlocked(tele_front) || sideBlocked(tele_back) ||
-                       sideBlocked(tele_left)  ||
-                       // The right-hand sensor is excluded while wall
-                       // following, because being close to the wall on the
-                       // right IS the mission. Left in, this guard would abort
-                       // every successful wall follow the moment it worked --
-                       // a guard that fires on the intended behaviour.
-                       (!mission_wallfollow && sideBlocked(tele_right))) {
+                       (mission_wallfollow != 2 && sideBlocked(tele_left)) ||
+                       (mission_wallfollow != 1 && sideBlocked(tele_right))) {
                 obstacle_streak++;
             } else {
                 obstacle_streak = 0;
@@ -1040,7 +1066,8 @@ PARAM_GROUP_START(mission)
   PARAM_ADD(PARAM_UINT32, minobst,    &mission_minobst)
   PARAM_ADD(PARAM_UINT8,  guards,     &mission_guards)
   // 0 = hover out the timer exactly as the previous firmware did.
-  // 1 = seek a wall, follow it for half the timer, retrace the route home.
+  // 1 = follow a wall on the RIGHT for half the timer, then retrace home.
+  // 2 = the same, following a wall on the LEFT.
   // Defaults to 0 so flashing this cannot regress a drone that already flies.
   PARAM_ADD(PARAM_UINT8,  wallfollow, &mission_wallfollow)
   PARAM_ADD(PARAM_UINT32, walldist,   &mission_walldist)

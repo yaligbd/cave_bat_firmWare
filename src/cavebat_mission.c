@@ -813,6 +813,16 @@ void appMain(void) {
                     float newYaw = mission_yaw;
                     float advance = 0.0f;   // metres along the NEW heading
 
+                    // What this step decided, printed once at the end.
+                    //
+                    // Three sessions of wall-following crashes have been lost
+                    // because nothing recorded what the drone was thinking in
+                    // the two seconds before it went over. One short line per
+                    // step costs less console traffic than the per-corner
+                    // messages it replaces, and it is the whole picture:
+                    // which way it is following, what it sees, what it chose.
+                    const char *act = "FWD";
+
                     bool frontClose = (f > 0) && (f < FRONT_STOP_MM);
                     bool wallGone   = (side == 0) || (side > WALL_LOST_MM);
                     bool tooClose   = (side > 0) && (side < WALL_PANIC_MM);
@@ -830,7 +840,7 @@ void appMain(void) {
                         advance = 0.0f;
                         confirm_in = 0;
                         confirm_out = 0;
-                        DEBUG_PRINT("CAVEBAT: too close %d, turning away\n", (int)side);
+                        act = "CLOSE";
 
                     } else if (confirm_in >= CONFIRM_IN) {
                         // INWARD CORNER. The wall has turned across the path,
@@ -839,7 +849,7 @@ void appMain(void) {
                         // angle, each re-read, rather than one blind ninety.
                         newYaw = wrapYaw(mission_yaw + follow_sign * TURN_IN_DEG * DEG2RAD);
                         advance = 0.0f;
-                        DEBUG_PRINT("CAVEBAT: corner in, f=%d\n", (int)f);
+                        act = "IN";
 
                     } else if (confirm_out >= CONFIRM_OUT && waypoint_count > 1) {
                         // OUTWARD CORNER. The wall turned away from under the
@@ -853,7 +863,7 @@ void appMain(void) {
                         // again.
                         newYaw = wrapYaw(mission_yaw - follow_sign * TURN_OUT_DEG * DEG2RAD);
                         advance = 0.0f;
-                        DEBUG_PRINT("CAVEBAT: corner out\n");
+                        act = "OUT";
 
                     } else if (wallGone) {
                         // No wall on the followed side, and not yet confirmed
@@ -862,6 +872,7 @@ void appMain(void) {
                         // answer to a single dropped reading: carrying straight
                         // on cannot fly the drone into a wall it has lost
                         // track of.
+                        act = "SEEK";
                         advance = STEP_FWD_MM / 1000.0f;
 
                     } else {
@@ -877,8 +888,17 @@ void appMain(void) {
                         if (trim >  MAX_TRIM_DEG) trim =  MAX_TRIM_DEG;
                         if (trim < -MAX_TRIM_DEG) trim = -MAX_TRIM_DEG;
                         newYaw = wrapYaw(mission_yaw + trim * DEG2RAD);
+                        act = "TRIM";
                         advance = STEP_FWD_MM / 1000.0f;
                     }
+
+                    // Short on purpose. A long line here would queue behind
+                    // itself on a 20-byte link and arrive after the crash,
+                    // which is exactly how the earlier logs lost the evidence.
+                    DEBUG_PRINT("WF%c f=%d s=%d %s y=%d\n",
+                                (mission_wallfollow == 2) ? 'L' : 'R',
+                                (int)f, (int)side, act,
+                                (int)(newYaw * RAD2DEG));
 
                     float nx = cx + advance * cosf(newYaw);
                     float ny = cy + advance * sinf(newYaw);

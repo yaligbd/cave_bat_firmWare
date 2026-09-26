@@ -18,7 +18,10 @@
 # obj-y += cavebat_record.o
 obj-y += cavebat_mission.o
 obj-y += cavebat_multiranger.o
+# Bitcraze's wall-following state machine (McGuire et al., Science Robotics
+# 2019). NOT an appMain -- cavebat_mission.c calls into it. Required by the
+# mission build, not optional.
+obj-y += wallfollowing_multiranger_onboard.o
 # obj-y += cavebat_wall.o
-# obj-y += wallfollowing_multiranger_onboard.o
 # obj-y += cavebat.o
 # obj-y += cavebat_i2cscan.o

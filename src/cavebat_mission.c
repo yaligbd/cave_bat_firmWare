@@ -20,6 +20,7 @@
 #include "crtp_commander_high_level.h"
 #include "stabilizer_types.h"
 #include "crtp.h"
+#include "wallfollowing_multiranger_onboard.h"
 #include <string.h>
 #include <math.h>
 
@@ -181,103 +182,94 @@ static uint8_t rangeTo2cm(uint16_t mm) {
 // apart.
 static uint8_t mission_wallfollow = 0;
 
-// +1 when following the wall on the right, -1 when following it on the left.
-// Multiplying every yaw change by this mirrors the whole controller.
-static float follow_sign = 1.0f;
-
 // Distance to keep from the wall, mm. Set by the app.
 static uint32_t mission_walldist = 400;
-
-// --- Not used any more (left over from the older sideways-only version) ----
-#define WALL_BAND_MM     120
-#define WALL_MAX_MM     1200
-// ----------------------------------------------------------------------------
-
-// Size of one forward hop, mm.
-#define STEP_FWD_MM      200
-#define STEP_SIDE_MM     150   // not used any more
-
-// Something this close IN FRONT = inside corner, turn left.
-#define FRONT_STOP_MM    500
 
 // SAFETY: this far from the takeoff spot = stop and fly home. mm.
 #define GEOFENCE_MM     4000
 
-// Hop speed, m/s. Slow on purpose: more sensor readings per metre.
+// Speed, m/s, for both the return hops and the wall follower. Slow on
+// purpose: more sensor readings per metre travelled.
 #define STEP_SPEED_MS    0.2f
-
-// --- Turning ----------------------------------------------------------------
-// The drone steers like a person walking along a wall:
-//   wall ahead          -> inside corner  -> turn left on the spot
-//   wall on right gone  -> outside corner -> turn right on the spot
-//   wall there          -> small steering fix to keep the distance, fly on
-
-// Degrees turned per hop at a corner. Small, so it re-checks during a turn.
-#define TURN_IN_DEG      25.0f
-#define TURN_OUT_DEG     20.0f
-
-// How many decisions in a row must agree before turning at a corner.
-// Right turns (toward the wall) need more proof than left turns.
-#define CONFIRM_IN       2
-#define CONFIRM_OUT      3
-static uint8_t confirm_in = 0;
-static uint8_t confirm_out = 0;
-
-// Steering fix while following: at most 10 degrees per hop,
-// 0.04 degrees for every mm the drone is off the target distance.
-#define MAX_TRIM_DEG     10.0f
-#define TRIM_DEG_PER_MM  0.04f
-
-// SAFETY: wall on the right closer than this = turn away, no matter what.
-#define WALL_PANIC_MM    220
-
-// Wall on the right farther than this = it's gone (outside corner).
-#define WALL_LOST_MM    1400
-
-#define STEP_CORNER_MM   150   // not used any more
 
 // Unit conversions: degrees <-> radians.
 #define DEG2RAD          0.017453292f
 #define RAD2DEG          57.29578f
 
-// Which way the drone is being told to face, in radians. 0 = the way it
-// faced at takeoff.
+// --- How the wall gets followed ---------------------------------------------
+//
+// This is NOT our own controller any more. It is Bitcraze's, from
+// wallfollowing_multiranger_onboard.c -- the one published with McGuire et al.,
+// "Minimal navigation solution for a swarm of tiny flying robots to explore an
+// unknown environment", Science Robotics 4(35), 2019. It has been flown on real
+// swarms. We call it and fly what it says.
+//
+// WHY WE REPLACED OUR OWN, because this is the whole lesson of the project:
+//
+//   Our controller could only STEER. To fix its distance from the wall it had
+//   to turn, and turning changes where it is going, so a small distance error
+//   became a heading error, which produced a LARGER distance error a moment
+//   later. The loop fed itself. Seven-second flights were fine because there
+//   was no time for it to build up. A fourteen-second flight crept in to 20cm
+//   and touched the wall. That is not a tuning problem, it is a controller
+//   that was never stable -- it just diverged slower than the flights were
+//   long.
+//
+//   Bitcraze's controller SLIDES SIDEWAYS to hold the distance while keeping
+//   the nose pointed along the wall. Distance and heading stay independent, so
+//   an error in one cannot grow the other.
+//
+// That difference is why this needs velocity setpoints and the old one did
+// not: strafing is something you can only ask for as a velocity.
+//
+// ONE DELIBERATE DEVIATION from the Bitcraze demo: their loop decides at
+// 100Hz. Ours decides at 10Hz, because this loop also carries the recording,
+// the battery guard and the obstacle guard, all of which are tuned for 10Hz
+// and none of which should be disturbed. The setpoint is still REFRESHED at
+// 100Hz (see the foot of the main loop), so the aircraft is never flying an
+// aging command. The correction is bang-bang at half of WF_SPEED_MS, so a
+// 10Hz decision overshoots by at most 1cm before it is reconsidered -- well
+// inside the 10cm deadband the controller works to.
+#define WF_SPEED_MS      0.2f
+
+// Drop a breadcrumb every time the drone has moved this far since the last
+// one. The old controller dropped one per completed hop; there are no hops
+// any more, so distance is what marks the trail now.
+#define WF_CRUMB_MM      300
+
+// True while velocity setpoints are driving the aircraft. It gates the 100Hz
+// refresh at the foot of the loop, and it is how the return leg knows it has
+// to hand control back to the high-level commander.
+static bool vel_active = false;
+
+// The one setpoint struct, reused. Held at file scope because the 100Hz
+// refresh re-sends it without rebuilding it.
+static setpoint_t wf_setpoint;
+
+// Which state the follower is in, published so a crash log says what the
+// aircraft was doing rather than leaving us to guess again.
+static StateWF wf_state = forward;
+static uint8_t tele_wfstate = 0;
+
+// The sensors the follower reads. File scope because it runs outside the
+// block where appMain keeps its own log handles.
+static logVarId_t wf_idFront, wf_idLeft, wf_idRight, wf_idYaw;
+
+// Where the last breadcrumb was dropped, mm.
+static int16_t crumb_x = 0, crumb_y = 0;
+
+// The heading the RETURN leg is holding, in radians. Bookkeeping for
+// issueStep, which needs to know the heading it last commanded so it can work
+// out how long a turn should take. 0 = the way the drone faced at takeoff.
 static float mission_yaw = 0.0f;
 
-// --- Sensor smoothing -------------------------------------------------------
-// Decisions use the MEDIAN of the last 5 readings, never one reading.
-// Why: a sensor sometimes returns 0 by mistake, and 0 on the right sensor
-// means "wall gone" -> turn toward the wall. One glitch could fly the drone
-// into the wall. The median throws glitches away.
-#define RANGE_HIST 5
-static uint16_t hist_front[RANGE_HIST];
-static uint16_t hist_right[RANGE_HIST];
-static uint16_t hist_left[RANGE_HIST];
-static uint8_t  hist_pos = 0;
-static uint8_t  hist_fill = 0;
-
-// Add the newest front, right and left readings to the history.
-static void pushRanges(uint16_t f, uint16_t r, uint16_t l) {
-  hist_front[hist_pos] = f;
-  hist_right[hist_pos] = r;
-  hist_left[hist_pos]  = l;
-  hist_pos = (uint8_t)((hist_pos + 1) % RANGE_HIST);
-  if (hist_fill < RANGE_HIST) hist_fill++;
-}
-
-// Return the middle value of the history (sort a copy, take the middle).
-static uint16_t medianOf(const uint16_t *buf) {
-  uint16_t t[RANGE_HIST];
-  uint8_t n = hist_fill;
-  for (uint8_t i = 0; i < n; i++) t[i] = buf[i];
-  for (uint8_t i = 1; i < n; i++) {          // insertion sort, n is 5
-    uint16_t v = t[i];
-    int8_t j = (int8_t)i - 1;
-    while (j >= 0 && t[j] > v) { t[j + 1] = t[j]; j--; }
-    t[j + 1] = v;
-  }
-  return n ? t[n / 2] : 0;
-}
+// The heading the drone ACTUALLY has, in radians, read from the estimator.
+//
+// This is what gets recorded, not mission_yaw. Under the wall follower the
+// heading is commanded as a RATE, so there is no commanded angle to record --
+// and a measured heading is the better thing to draw the map from anyway,
+// because it is what the aircraft really did.
+static float meas_yaw = 0.0f;
 
 // Keep an angle between -180 and +180 degrees (in radians), so turning the
 // same way many times never grows the number forever.
@@ -291,14 +283,6 @@ static float wrapYaw(float y) {
 // anyway. Stops one stuck hop from leaving the drone hanging in the air.
 #define STEP_GRACE_MS    1500
 
-// --- Pause after turning (NEW - never flown, not in v11) --------------------
-// After a turn bigger than 8 degrees, hover still for 1 second before the
-// next hop. Idea: turning confuses the floor camera for a moment, so let it
-// settle first. A guess, not proven - no crash was ever caught in a log.
-#define TURN_SETTLE_MS   1000
-#define TURN_SETTLE_DEG  8.0f
-
-static TickType_t settle_until = 0;
 static float last_turn_deg = 0.0f;
 
 // --- Breadcrumbs --------------------------------------------------------------
@@ -398,6 +382,84 @@ static void dropBreadcrumb(void) {
     waypoints[waypoint_count].y = tele_y;
     waypoint_count++;
   }
+  crumb_x = tele_x;
+  crumb_y = tele_y;
+}
+
+// --- Flying on velocity, for the wall follower ------------------------------
+//
+// Height stays an ABSOLUTE setpoint while x, y and yaw are velocities. That
+// mixture is what lets the follower strafe and rotate without ever having an
+// opinion about altitude, which the barometer and the down ranger hold on
+// their own. Copied from Bitcraze's own demo, deliberately unchanged.
+//
+// velocity_body = true means vx is "forward" and vy is "left" as the DRONE is
+// pointing, not as the room is laid out. The follower thinks entirely in its
+// own frame, so anything else would need a rotation here and would be one more
+// place to get a sign wrong.
+//
+// Priority 3 beats the high-level commander's 1, so the first of these calls
+// takes the aircraft off the trajectory planner automatically.
+static void sendBodyVelocity(float vx, float vy, float z_m, float yawRateDeg) {
+  memset(&wf_setpoint, 0, sizeof(wf_setpoint));
+  wf_setpoint.mode.z   = modeAbs;       wf_setpoint.position.z = z_m;
+  wf_setpoint.mode.yaw = modeVelocity;  wf_setpoint.attitudeRate.yaw = yawRateDeg;
+  wf_setpoint.mode.x   = modeVelocity;  wf_setpoint.mode.y = modeVelocity;
+  wf_setpoint.velocity.x = vx;          wf_setpoint.velocity.y = vy;
+  wf_setpoint.velocity_body = true;
+  commanderSetSetpoint(&wf_setpoint, 3);
+}
+
+// Run the follower once and fly what it says.
+//
+// The ranges handed over are the RAW log values in metres, NOT tele_front and
+// friends. That is not a shortcut, it is required: clampRange() turns anything
+// out of range into 0, and this controller reads 0 as "the wall is touching my
+// nose" and turns immediately. The driver reports 32767mm for nothing-in-range,
+// which divided by 1000 is 32.7 metres -- exactly the "no wall anywhere" the
+// controller expects, and what Bitcraze's own demo feeds it.
+//
+// direction is +1 with the wall on the RIGHT and -1 with it on the LEFT, which
+// is the pairing Bitcraze's demo uses with the matching sensor.
+static void wfTick(void) {
+  float frontRange = safeLogFloat(wf_idFront) / 1000.0f;
+  float sideRange  = (mission_wallfollow == 2 ? safeLogFloat(wf_idLeft)
+                                              : safeLogFloat(wf_idRight)) / 1000.0f;
+  float yawRad     = safeLogFloat(wf_idYaw) * DEG2RAD;
+  int   direction  = (mission_wallfollow == 2) ? -1 : 1;
+
+  // The follower measures its own timeouts in seconds against this, so it has
+  // to keep counting up across the whole flight. Ticks since boot, as seconds.
+  float now_s = (float)xTaskGetTickCount() / (float)configTICK_RATE_HZ;
+
+  float vx = 0.0f, vy = 0.0f, yawRateRad = 0.0f;
+  wf_state = wallFollower(&vx, &vy, &yawRateRad,
+                          frontRange, sideRange, yawRad, direction, now_s);
+  tele_wfstate = (uint8_t)wf_state;
+
+  sendBodyVelocity(vx, vy, mission_height / 1000.0f, yawRateRad * RAD2DEG);
+}
+
+// Give the aircraft back to the high-level commander.
+//
+// MUST be called before any goTo or land that follows wall following, and this
+// is the one piece of the port that is a safety matter rather than a behaviour
+// one. Velocity setpoints are sent at priority 3 and the high-level commander
+// sits at 1, so while the 100Hz refresh is running a land command is accepted
+// and then immediately overridden -- the drone would simply keep flying.
+// Clearing vel_active stops the refresh; commanderRelaxPriority() then tells
+// the planner the live state estimate and lowers the priority so its own
+// setpoints take effect again.
+static void releaseToHighLevel(void) {
+  if (!vel_active) return;
+  vel_active = false;
+  // Stop moving, and hold still long enough to actually be stopped. Relaxing
+  // mid-slide hands over a velocity the planner does not know it must arrest.
+  sendBodyVelocity(0.0f, 0.0f, mission_height / 1000.0f, 0.0f);
+  vTaskDelay(M2T(400));
+  commanderRelaxPriority();
+  // Whatever heading it ended up on becomes the heading to hold from here.
+  mission_yaw = wrapYaw(safeLogFloat(wf_idYaw) * DEG2RAD);
 }
 
 // --- Download protocol, CRTP port 14 --------------------------------------
@@ -492,6 +554,14 @@ void appMain(void) {
   logVarId_t idX     = logGetVarId("stateEstimate", "x");
   logVarId_t idY     = logGetVarId("stateEstimate", "y");
   logVarId_t idZ     = logGetVarId("stateEstimate", "z");
+  logVarId_t idYaw   = logGetVarId("stabilizer", "yaw");
+
+  // The same handles again at file scope, for the wall follower. It runs from
+  // the 100Hz refresh at the foot of the loop, outside this function's scope.
+  wf_idFront = idFront;
+  wf_idLeft  = idLeft;
+  wf_idRight = idRight;
+  wf_idYaw   = idYaw;
 
   DEBUG_PRINT("CAVEBAT: Flight & Telemetry starting\n");
   
@@ -525,10 +595,9 @@ void appMain(void) {
     tele_right = clampRange(safeLogFloat(idRight));
     tele_up    = clampRange(safeLogFloat(idUp));
     tele_down  = clampRange(safeLogFloat(idDown));
-    tele_yaw   = (int16_t)(mission_yaw * RAD2DEG);
-    // Sampled at the full 10Hz loop rate rather than once per step, so a step
-    // that lasts a second is decided on ten readings instead of one.
-    pushRanges(tele_front, tele_right, tele_left);
+    // The heading the aircraft really has. Recorded, and used to draw the map.
+    meas_yaw   = safeLogFloat(idYaw) * DEG2RAD;
+    tele_yaw   = (int16_t)(meas_yaw * RAD2DEG);
     tele_x     = (int16_t)(safeLogFloat(idX) * 1000.0f);
     tele_y     = (int16_t)(safeLogFloat(idY) * 1000.0f);
     tele_z     = (int16_t)(safeLogFloat(idZ) * 1000.0f);
@@ -554,7 +623,7 @@ void appMain(void) {
       if (sample_count < MAX_SAMPLES) {
         FlightSample *fs = &flight_log[sample_count];
         fs->x = tele_x;  fs->y = tele_y;  fs->z = tele_z;
-        fs->yaw = (int16_t)(mission_yaw * RAD2DEG);
+        fs->yaw = (int16_t)(meas_yaw * RAD2DEG);
         fs->front = rangeTo2cm(tele_front);
         fs->back  = rangeTo2cm(tele_back);
         fs->left  = rangeTo2cm(tele_left);
@@ -663,17 +732,22 @@ void appMain(void) {
         // heading in the mission is relative to how it was placed, which is
         // what a pilot expects and what the estimator assumes.
         mission_yaw = 0.0f;
-        // Right-hand following turns one way at a corner, left-hand following
-        // turns the other. Fixed once here rather than tested at every branch.
-        follow_sign = (mission_wallfollow == 2) ? -1.0f : 1.0f;
-        confirm_in = 0;
-        confirm_out = 0;
-        hist_pos = 0;
-        hist_fill = 0;
-        settle_until = 0;
+        meas_yaw = 0.0f;
         last_turn_deg = 0.0f;
         waypoint_count = 0;
         step_active = false;
+        // Every flight starts the follower from scratch. It keeps its state
+        // machine, its heading reference and its corner bookkeeping in statics,
+        // so a second flight on a warm drone would otherwise begin halfway
+        // through the previous one's corner.
+        vel_active = false;
+        wf_state = forward;
+        tele_wfstate = 0;
+        crumb_x = 0;
+        crumb_y = 0;
+        if (mission_wallfollow) {
+          wallFollowerInit(mission_walldist / 1000.0f, WF_SPEED_MS, forward);
+        }
         climb_done_tick = xTaskGetTickCount()
                         + M2T((uint32_t)(takeoff_duration * 1000.0f));
         hover_deadline = xTaskGetTickCount()
@@ -743,30 +817,19 @@ void appMain(void) {
                     tele_outwhy = 1;
                     tele_phase = PHASE_LANDING;
                 }
-            } else if (!stepFinished()) {
-                // A step is in the air. Let it land before deciding anything --
-                // reading the sensors mid-move and re-commanding on top of an
-                // unfinished trajectory is how a follower starts oscillating.
             } else {
-                if (step_active) {
-                    step_active = false;
-                    dropBreadcrumb();
-                    // A step that turned earns a pause before the next one.
-                    if (last_turn_deg >= TURN_SETTLE_DEG) {
-                        settle_until = xTaskGetTickCount() + M2T(TURN_SETTLE_MS);
-                    }
-                }
-
-                // Standing still after a turn. The high-level commander holds
-                // position on its own, so doing nothing here IS the hold.
-                if ((int32_t)(xTaskGetTickCount() - settle_until) < 0) {
-                    goto skip_step;
-                }
-
-                // Reasons to turn for home, checked before committing to
-                // another step outward. Order matters: the geofence outranks
-                // the clock, because too far is a safety limit while time is up
-                // is only a plan.
+                // --- Following a wall ------------------------------------
+                //
+                // No hops and no waiting for a trajectory to finish. The
+                // aircraft is under continuous velocity control, so every tick
+                // simply asks the follower what to do now and does it.
+                //
+                // The reasons to turn for home are checked FIRST, and they are
+                // checked every tick rather than only between hops, so the
+                // geofence now catches a runaway within 100ms instead of
+                // whenever the current hop happened to end. Order matters: the
+                // geofence outranks the clock, because too far is a safety
+                // limit while time is up is only a plan.
                 if (beyondGeofence()) {
                     tele_outwhy = 2;
                     DEBUG_PRINT("CAVEBAT: geofence at %d,%d mm, returning\n",
@@ -782,134 +845,69 @@ void appMain(void) {
                                 (int)waypoint_count);
                     tele_phase = PHASE_RETURN;
                 } else {
-                    // --- Decide one step ---------------------------------
-                    //
-                    // The drone steers rather than strafes, so everything here
-                    // is relative to where it is currently pointing. Forward in
-                    // the world is (cos yaw, sin yaw).
-                    //
-                    // RIGHT and LEFT following are the same controller. The
-                    // only differences are which sensor is read and which way
-                    // each turn goes, so the sensor is picked once into `side`
-                    // and every yaw change is multiplied by follow_sign. With
-                    // follow_sign = +1 this is exactly the right-hand follower
-                    // that flew; with -1 it is its mirror image.
-                    //
-                    // Every reading used here is a MEDIAN of the last half
-                    // second, never a single sample. The first version steered
-                    // on instantaneous values and flew into the wall, because a
-                    // VL53L1x returning 0 for a failed read is indistinguish-
-                    // able from one returning 0 for "nothing there", and the
-                    // response to "nothing there" is to turn toward the wall.
-                    float cx = tele_x / 1000.0f;
-                    float cy = tele_y / 1000.0f;
-                    float cz = mission_height / 1000.0f;
+                    // Fly the wall. wfTick() reads the sensors, runs Bitcraze's
+                    // state machine and sends the setpoint; the refresh at the
+                    // foot of the loop keeps that setpoint alive at 100Hz.
+                    vel_active = true;
+                    wfTick();
 
-                    uint16_t f    = medianOf(hist_front);
-                    uint16_t side = (mission_wallfollow == 2)
-                                      ? medianOf(hist_left)
-                                      : medianOf(hist_right);
-
-                    float newYaw = mission_yaw;
-                    float advance = 0.0f;   // metres along the NEW heading
-
-                    // What this step decided, printed once at the end.
-                    //
-                    // Three sessions of wall-following crashes have been lost
-                    // because nothing recorded what the drone was thinking in
-                    // the two seconds before it went over. One short line per
-                    // step costs less console traffic than the per-corner
-                    // messages it replaces, and it is the whole picture:
-                    // which way it is following, what it sees, what it chose.
-                    const char *act = "FWD";
-
-                    bool frontClose = (f > 0) && (f < FRONT_STOP_MM);
-                    bool wallGone   = (side == 0) || (side > WALL_LOST_MM);
-                    bool tooClose   = (side > 0) && (side < WALL_PANIC_MM);
-
-                    // Streaks, so one odd decision cannot turn the aircraft.
-                    if (frontClose) confirm_in++;  else confirm_in = 0;
-                    if (wallGone)   confirm_out++; else confirm_out = 0;
-
-                    if (tooClose) {
-                        // TOO CLOSE. This outranks everything, including a
-                        // wall detected ahead, because whatever else is true
-                        // the drone is about to touch the thing it is
-                        // following. Turn away, do not advance.
-                        newYaw = wrapYaw(mission_yaw + follow_sign * TURN_IN_DEG * DEG2RAD);
-                        advance = 0.0f;
-                        confirm_in = 0;
-                        confirm_out = 0;
-                        act = "CLOSE";
-
-                    } else if (confirm_in >= CONFIRM_IN) {
-                        // INWARD CORNER. The wall has turned across the path,
-                        // so the way on is away from it. Rotate on the spot and
-                        // look again -- several small turns through a right
-                        // angle, each re-read, rather than one blind ninety.
-                        newYaw = wrapYaw(mission_yaw + follow_sign * TURN_IN_DEG * DEG2RAD);
-                        advance = 0.0f;
-                        act = "IN";
-
-                    } else if (confirm_out >= CONFIRM_OUT && waypoint_count > 1) {
-                        // OUTWARD CORNER. The wall turned away from under the
-                        // drone, so it follows it round by turning toward where
-                        // the wall used to be.
-                        //
-                        // That is the one turn that can end in a collision, so
-                        // it needs three agreeing decisions and it does not
-                        // advance while turning. The step after this one either
-                        // finds the wall again and resumes following, or turns
-                        // again.
-                        newYaw = wrapYaw(mission_yaw - follow_sign * TURN_OUT_DEG * DEG2RAD);
-                        advance = 0.0f;
-                        act = "OUT";
-
-                    } else if (wallGone) {
-                        // No wall on the followed side, and not yet confirmed
-                        // as a corner. Hold the heading and fly on. This is
-                        // both the search that opens the mission and the safe
-                        // answer to a single dropped reading: carrying straight
-                        // on cannot fly the drone into a wall it has lost
-                        // track of.
-                        act = "SEEK";
-                        advance = STEP_FWD_MM / 1000.0f;
-
-                    } else {
-                        // FOLLOWING. Trim the heading in proportion to how far
-                        // off the target distance the wall is, then fly on.
-                        // Too far turns toward it, too close turns away.
-                        //
-                        // Proportional so a gentle curve gets a gentle
-                        // correction, and capped hard: with the wall 400mm away
-                        // there is no room for a large correction to be wrong.
-                        float err = (float)side - (float)mission_walldist;
-                        float trim = -follow_sign * err * TRIM_DEG_PER_MM;
-                        if (trim >  MAX_TRIM_DEG) trim =  MAX_TRIM_DEG;
-                        if (trim < -MAX_TRIM_DEG) trim = -MAX_TRIM_DEG;
-                        newYaw = wrapYaw(mission_yaw + trim * DEG2RAD);
-                        act = "TRIM";
-                        advance = STEP_FWD_MM / 1000.0f;
+                    // Mark the trail by distance travelled. The return leg
+                    // retraces these, so they have to be close enough together
+                    // that flying straight between two of them cannot cut a
+                    // corner the drone went round.
+                    // 64-bit for the same reason beyondGeofence() is: these are
+                    // millimetres from an estimator that has already been seen
+                    // to report 6401mm in a 500mm hover, and a squared
+                    // difference of two diverged readings passes INT32_MAX.
+                    int64_t dx = (int64_t)tele_x - (int64_t)crumb_x;
+                    int64_t dy = (int64_t)tele_y - (int64_t)crumb_y;
+                    if (dx * dx + dy * dy
+                          >= (int64_t)WF_CRUMB_MM * (int64_t)WF_CRUMB_MM) {
+                        dropBreadcrumb();
                     }
 
-                    // Short on purpose. A long line here would queue behind
-                    // itself on a 20-byte link and arrive after the crash,
-                    // which is exactly how the earlier logs lost the evidence.
-                    DEBUG_PRINT("WF%c f=%d s=%d %s y=%d\n",
-                                (mission_wallfollow == 2) ? 'L' : 'R',
-                                (int)f, (int)side, act,
-                                (int)(newYaw * RAD2DEG));
-
-                    float nx = cx + advance * cosf(newYaw);
-                    float ny = cy + advance * sinf(newYaw);
-                    issueStep(nx, ny, cz, newYaw);
+                    // One line per second, not per tick.
+                    //
+                    // Three sessions of wall-following crashes were lost
+                    // because nothing recorded what the aircraft was thinking
+                    // in the two seconds before it went over. This is that
+                    // record -- and it is short and slow on purpose, because a
+                    // long line printed ten times a second queues behind
+                    // itself on a 20-byte BLE link and arrives after the crash
+                    // it was meant to explain.
+                    //
+                    // st is the follower's state: 0 forward, 1 hover,
+                    // 2 turnToFindWall, 3 turnToAlignToWall, 4 forwardAlongWall,
+                    // 5 rotateAroundWall, 6 rotateInCorner, 7 findCorner.
+                    if ((tele_alive % 10) == 0) {
+                        DEBUG_PRINT("WF%c st=%d f=%d s=%d\n",
+                                    (mission_wallfollow == 2) ? 'L' : 'R',
+                                    (int)tele_wfstate,
+                                    (int)tele_front,
+                                    (int)(mission_wallfollow == 2 ? tele_left
+                                                                  : tele_right));
+                    }
                 }
-                skip_step: ;
             }
 
             // Entering the return leg from any of the branches above: rewind to
             // the newest breadcrumb and start walking the trail backwards.
             if (tele_phase == PHASE_RETURN) {
+                // Hand the aircraft back to the trajectory planner first.
+                //
+                // The return leg flies goTo hops, which belong to the
+                // high-level commander -- but the follower has just spent the
+                // whole outbound leg overriding it at a higher priority, and
+                // the planner's idea of where the drone is has been frozen
+                // since takeoff. Handing back without saying so would make the
+                // first hop start from the takeoff pad and fly the difference
+                // as fast as it could.
+                //
+                // commanderRelaxPriority() is the firmware's own answer to
+                // exactly this: it tells the planner the live state estimate
+                // and drops the priority in one go, so the next goTo plans
+                // from where the aircraft actually is.
+                releaseToHighLevel();
                 step_active = false;
                 return_index = waypoint_count;   // decremented before first use
             }
@@ -940,6 +938,9 @@ void appMain(void) {
         }
 
         if (tele_phase == PHASE_LANDING) {
+            // Before anything else: a land command is worthless while velocity
+            // setpoints are still being refreshed over the top of it.
+            releaseToHighLevel();
             tele_endwhy = 1;
             DEBUG_PRINT("CAVEBAT: FLIGHT OK, peak %d of %d mm, %d samples, %d pts, why %d\n",
                         (int)tele_maxz, (int)mission_height, (int)sample_count,
@@ -1017,6 +1018,7 @@ void appMain(void) {
 
     } else if (mission_state == 2) {
         // App requested Abort
+        releaseToHighLevel();   // or the land below is overridden, see above
         tele_endwhy = 2;
         tele_phase = PHASE_LANDING;
         step_active = false;
@@ -1052,8 +1054,25 @@ void appMain(void) {
                   (int)tele_up, (int)tele_down);
     }
     
-    // Stream data at 10Hz (100ms) to ensure app captures 1 sample per second cleanly
-    vTaskDelay(M2T(100));
+    // The loop stays at 10Hz. Everything above is tuned for it: the guards
+    // count ticks, the heartbeat divides by it, and the app expects telemetry
+    // at this rate.
+    //
+    // But a velocity setpoint cannot be left to age for 100ms -- the aircraft
+    // goes on obeying the last one it was given, so at 10Hz it would fly each
+    // command in 10cm lurches. So the delay is spent in ten 10ms slices and the
+    // setpoint is re-sent on each, which is the 100Hz Bitcraze's follower was
+    // proven at. commanderSetSetpoint() re-stamps the timestamp, so re-sending
+    // the same struct is exactly what keeps it alive.
+    //
+    // While not wall following this is one unchanged 100ms delay, so the hover
+    // path behaves precisely as it did before.
+    for (uint8_t i = 0; i < 10; i++) {
+      vTaskDelay(M2T(10));
+      if (vel_active) {
+        commanderSetSetpoint(&wf_setpoint, 3);
+      }
+    }
   }
 }
 
@@ -1065,6 +1084,11 @@ PARAM_GROUP_START(tele)
   PARAM_ADD(PARAM_UINT16, maxz,   &tele_maxz)
   PARAM_ADD(PARAM_UINT16, samples, &tele_samples)
   PARAM_ADD(PARAM_UINT8,  endwhy, &tele_endwhy)
+  // NOT exposed: tele_wfstate. The follower's state goes out in the WF trace
+  // line instead. Adding a parameter changes the parameter table, which
+  // invalidates the app's cached copy and needs KNOWN_PARAM_NAMES updated to
+  // match -- a mismatch there already cost one flight. The console line
+  // carries the same information at no such cost.
   PARAM_ADD(PARAM_UINT16, vbat,  &tele_vbat)
   PARAM_ADD(PARAM_UINT16, front, &tele_front)
   PARAM_ADD(PARAM_UINT16, back,  &tele_back)

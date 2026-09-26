@@ -258,6 +258,9 @@ static logVarId_t wf_idFront, wf_idLeft, wf_idRight, wf_idYaw;
 // Where the last breadcrumb was dropped, mm.
 static int16_t crumb_x = 0, crumb_y = 0;
 
+// Tick at which the braking phase began, so the ramp knows how far along it is.
+static TickType_t brake_start = 0;
+
 // The heading the RETURN leg is holding, in radians. Bookkeeping for
 // issueStep, which needs to know the heading it last commanded so it can work
 // out how long a turn should take. 0 = the way the drone faced at takeoff.
@@ -298,6 +301,26 @@ static uint16_t waypoint_count = 0;
 #define PHASE_OUTBOUND  2
 #define PHASE_RETURN    3
 #define PHASE_LANDING   4
+// Slowing down, between following the wall and flying home.
+//
+// This phase exists because its absence crashed the aircraft. The outbound leg
+// ended by stepping the commanded velocity straight from full speed to zero,
+// and stopping a quadrotor means pitching up, which trades away the vertical
+// component of its thrust. With the pack sagging to 3219mV there was no
+// headroom left to brake and hold height at the same time, so it sank -- about
+// 20cm on a good day, and on a bad one the attitude went with it and the
+// aircraft ended on its back. The log is unambiguous: seven healthy lines at
+// st=4 holding 400mm, then "returning", then 65 degrees of roll.
+//
+// So the speed is ramped down over BRAKE_MS instead, as a phase rather than a
+// blocking wait -- the old code slept 400ms inside the loop, which also blinded
+// the recording and the tilt watch for exactly the window where the failure
+// began.
+#define PHASE_BRAKE     5
+
+// How long to spend slowing down. Long enough that the aircraft never has to
+// pitch hard to lose 0.2 m/s.
+#define BRAKE_MS        800
 static uint8_t tele_phase = PHASE_IDLE;
 
 // Why the drone stopped going out and turned home (the app can read this):
@@ -453,26 +476,17 @@ static void wfTick(void) {
 static void releaseToHighLevel(void) {
   if (!vel_active) return;
   vel_active = false;
-  // Stop moving, and hold still long enough to actually be stopped. Relaxing
-  // mid-slide hands over a velocity the planner does not know it must arrest.
+  // One last command to hold still, so the aircraft is stopped by an
+  // instruction rather than by a supervisor that has given up on us: a setpoint
+  // older than 500ms trips supervisorStateWarningLevelOut, which disables x and
+  // y control and forces the aircraft level.
   //
-  // The hold is RE-SENT every 20ms rather than sent once and waited out. A
-  // single setpoint followed by a silent delay is what made the aircraft sag
-  // about 20cm at the start of every return leg:
-  //
-  //   the supervisor treats a setpoint older than 500ms as a fault and forces
-  //   supervisorStateWarningLevelOut, which disables x and y control and
-  //   commands the aircraft level.
-  //
-  // One setpoint, then 400ms of silence, then a further 100ms for the loop to
-  // come round to the first goTo, put the age at just over 500ms -- tripping
-  // the watchdog at exactly the moment the return started. Refreshing keeps it
-  // under 20ms, so the aircraft is stopped by a command rather than by a
-  // supervisor that has given up on us.
-  for (uint8_t i = 0; i < 20; i++) {
-    sendBodyVelocity(0.0f, 0.0f, mission_height / 1000.0f, 0.0f);
-    vTaskDelay(M2T(20));
-  }
+  // There is no wait here any more. PHASE_BRAKE has already ramped the speed
+  // down over BRAKE_MS before this is called, so by now the aircraft is
+  // stationary. The 400ms blocking wait this replaces was doing real harm: it
+  // stopped the loop, so the recording and the tilt watch went blind for
+  // exactly the window in which the aircraft started falling.
+  sendBodyVelocity(0.0f, 0.0f, mission_height / 1000.0f, 0.0f);
   commanderRelaxPriority();
   // Whatever heading it ended up on becomes the heading to hold from here.
   mission_yaw = wrapYaw(safeLogFloat(wf_idYaw) * DEG2RAD);
@@ -913,16 +927,19 @@ void appMain(void) {
                     tele_outwhy = 2;
                     DEBUG_PRINT("CAVEBAT: geofence at %d,%d mm, returning\n",
                                 (int)tele_x, (int)tele_y);
-                    tele_phase = PHASE_RETURN;
+                    tele_phase = PHASE_BRAKE;
+                    brake_start = xTaskGetTickCount();
                 } else if (waypoint_count >= MAX_WAYPOINTS) {
                     tele_outwhy = 4;
                     DEBUG_PRINT("CAVEBAT: breadcrumb trail full, returning\n");
-                    tele_phase = PHASE_RETURN;
+                    tele_phase = PHASE_BRAKE;
+                    brake_start = xTaskGetTickCount();
                 } else if ((int32_t)(xTaskGetTickCount() - outbound_deadline) >= 0) {
                     tele_outwhy = 1;
                     DEBUG_PRINT("CAVEBAT: half timer, returning over %d points\n",
                                 (int)waypoint_count);
-                    tele_phase = PHASE_RETURN;
+                    tele_phase = PHASE_BRAKE;
+                    brake_start = xTaskGetTickCount();
                 } else {
                     // Fly the wall. wfTick() reads the sensors, runs Bitcraze's
                     // state machine and sends the setpoint; the refresh at the
@@ -971,10 +988,28 @@ void appMain(void) {
                 }
             }
 
-            // Entering the return leg from any of the branches above: rewind to
-            // the newest breadcrumb and start walking the trail backwards.
-            if (tele_phase == PHASE_RETURN) {
-                // Hand the aircraft back to the trajectory planner first.
+        } else if (tele_phase == PHASE_BRAKE) {
+            // --- Slowing down before flying home -------------------------
+            //
+            // Ramp the commanded forward speed to zero over BRAKE_MS rather
+            // than dropping it in one tick. A quadrotor stops by pitching up,
+            // which trades away part of the thrust holding it in the air, so an
+            // instant stop demands a hard pitch and costs altitude at the worst
+            // possible moment. That is what put the aircraft on its back.
+            //
+            // Nothing blocks here: the ramp is spread over ordinary 10Hz ticks,
+            // so the recording and the tilt watch keep running right through
+            // the transition. The version this replaces slept 400ms inside the
+            // loop and went blind for exactly the window where it fell.
+            int32_t elapsed = (int32_t)(xTaskGetTickCount() - brake_start);
+            if (elapsed < (int32_t)M2T(BRAKE_MS)) {
+                float f = 1.0f - ((float)elapsed / (float)M2T(BRAKE_MS));
+                if (f < 0.0f) f = 0.0f;
+                vel_active = true;
+                sendBodyVelocity(WF_SPEED_MS * f, 0.0f,
+                                 mission_height / 1000.0f, 0.0f);
+            } else {
+                // Stopped. Hand the aircraft back to the trajectory planner.
                 //
                 // The return leg flies goTo hops, which belong to the
                 // high-level commander -- but the follower has just spent the
@@ -991,6 +1026,9 @@ void appMain(void) {
                 releaseToHighLevel();
                 step_active = false;
                 return_index = waypoint_count;   // decremented before first use
+                tele_phase = PHASE_RETURN;
+                DEBUG_PRINT("CAVEBAT: stopped, home over %d pts\n",
+                            (int)waypoint_count);
             }
 
         } else if (tele_phase == PHASE_RETURN) {

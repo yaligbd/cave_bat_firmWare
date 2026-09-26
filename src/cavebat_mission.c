@@ -232,6 +232,35 @@ static uint32_t mission_walldist = 400;
 // inside the 10cm deadband the controller works to.
 #define WF_SPEED_MS      0.2f
 
+// Ceiling on how fast the aircraft is allowed to rotate, degrees per second.
+//
+// WHY THIS EXISTS. Turning is where this aircraft kept failing: it tilted
+// through every corner, crashed at the turning point of a 45s flight, and
+// bumped the wall while pivoting at an inward corner. What makes that telling
+// is that a corner turn commands ZERO velocity -- commandTurn() sets cmdVelX to
+// 0 and the action clears cmdVelY, so nothing asks the aircraft to move at all.
+// Drifting anyway means the position estimate is wrong, not the controller.
+//
+// That is the Flow deck. The optical flow sensor watches the floor sweep past
+// during a yaw, the estimator reads part of that sweep as real translation, and
+// the velocity controller then works hard to cancel a motion that was never
+// happening. The tilt it uses to do that becomes drift, and 40cm from a wall
+// drift is a collision.
+//
+// Bitcraze set maxTurnRate to 0.5 rad/s (about 29 deg/s) alongside a forward
+// speed of 0.5 m/s. We fly at 0.2 m/s -- 40% of their speed at 100% of their
+// turn rate. Halving the rotation roughly halves how fast the flow estimate is
+// corrupted, at the cost of a 46-degree corner taking about 3 seconds instead
+// of 1.6. That trade was unaffordable while flights were 15 seconds long and
+// corners never completed; with a 45s timer there is room for it.
+//
+// Capped here in our own layer rather than by editing Bitcraze's file, so their
+// state machine stays exactly as published. This is safe because every one of
+// its transitions is driven by a MEASURED heading change or a range reading,
+// never by assuming a turn took a particular time -- so a slower turn simply
+// takes more ticks to satisfy the same condition.
+#define WF_MAX_YAWRATE_DEG  15.0f
+
 // Drop a breadcrumb every time the drone has moved this far since the last
 // one. The old controller dropped one per completed hop; there are no hops
 // any more, so distance is what marks the trail now.
@@ -460,7 +489,13 @@ static void wfTick(void) {
                           frontRange, sideRange, yawRad, direction, now_s);
   tele_wfstate = (uint8_t)wf_state;
 
-  sendBodyVelocity(vx, vy, mission_height / 1000.0f, yawRateRad * RAD2DEG);
+  // Cap the rotation. See WF_MAX_YAWRATE_DEG for why turning slowly matters
+  // more here than turning quickly.
+  float yawRateDeg = yawRateRad * RAD2DEG;
+  if (yawRateDeg >  WF_MAX_YAWRATE_DEG) yawRateDeg =  WF_MAX_YAWRATE_DEG;
+  if (yawRateDeg < -WF_MAX_YAWRATE_DEG) yawRateDeg = -WF_MAX_YAWRATE_DEG;
+
+  sendBodyVelocity(vx, vy, mission_height / 1000.0f, yawRateDeg);
 }
 
 // Give the aircraft back to the high-level commander.

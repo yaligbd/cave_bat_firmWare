@@ -555,6 +555,13 @@ void appMain(void) {
   logVarId_t idY     = logGetVarId("stateEstimate", "y");
   logVarId_t idZ     = logGetVarId("stateEstimate", "z");
   logVarId_t idYaw   = logGetVarId("stabilizer", "yaw");
+  // Tilt, for the crash trace. The aircraft has been flipping rather than
+  // colliding, and these two numbers are what tell those apart: a controller
+  // winding up against a bad estimate tilts further over several seconds,
+  // while something mechanical or an estimator jump goes from level to over
+  // inside one or two lines.
+  logVarId_t idRoll  = logGetVarId("stabilizer", "roll");
+  logVarId_t idPitch = logGetVarId("stabilizer", "pitch");
 
   // The same handles again at file scope, for the wall follower. It runs from
   // the 100Hz refresh at the foot of the loop, outside this function's scope.
@@ -601,6 +608,41 @@ void appMain(void) {
     tele_x     = (int16_t)(safeLogFloat(idX) * 1000.0f);
     tele_y     = (int16_t)(safeLogFloat(idY) * 1000.0f);
     tele_z     = (int16_t)(safeLogFloat(idZ) * 1000.0f);
+
+    // --- The tilt watch -----------------------------------------------------
+    //
+    // The aircraft has been FLIPPING, not colliding, and no log has ever caught
+    // it happening. This is the one line that can settle why.
+    //
+    // It prints at the full 10Hz, but ONLY past 15 degrees, which a healthy
+    // flight never reaches -- so it costs nothing until something is going
+    // wrong and then it is dense exactly when it matters. A line this short at
+    // 10Hz is affordable on a 20-byte link; the full WF line at that rate would
+    // not be, which is how earlier evidence was lost.
+    //
+    // WHAT THE ANSWER LOOKS LIKE, either way:
+    //   tilt climbing over several lines  -> the controller is winding up
+    //                                        against an estimate it cannot
+    //                                        trust, and the fix is in software
+    //   level, then over inside one line  -> nothing was chasing anything. A
+    //                                        motor, a prop or a sudden
+    //                                        estimator jump, and no amount of
+    //                                        controller work will help
+    //
+    // Deliberately not restricted to wall following: hover flipped earlier in
+    // this project too, and a flight already lost is not one whose console
+    // traffic needs protecting.
+    if (is_flying) {
+      float roll_now  = safeLogFloat(idRoll);
+      float pitch_now = safeLogFloat(idPitch);
+      if (roll_now < 0) roll_now = -roll_now;
+      if (pitch_now < 0) pitch_now = -pitch_now;
+      if (roll_now > 15.0f || pitch_now > 15.0f) {
+        DEBUG_PRINT("TILT r=%d p=%d z=%d\n",
+                    (int)safeLogFloat(idRoll), (int)safeLogFloat(idPitch),
+                    (int)tele_z);
+      }
+    }
 
     // Download requests. Safe at any time: this only reads the buffer, and the
     // app is only ever connected while the drone is on the ground.
@@ -901,12 +943,14 @@ void appMain(void) {
                     // 2 turnToFindWall, 3 turnToAlignToWall, 4 forwardAlongWall,
                     // 5 rotateAroundWall, 6 rotateInCorner, 7 findCorner.
                     if ((tele_alive % 10) == 0) {
-                        DEBUG_PRINT("WF%c st=%d f=%d s=%d\n",
+                        DEBUG_PRINT("WF%c st=%d f=%d s=%d r=%d p=%d\n",
                                     (mission_wallfollow == 2) ? 'L' : 'R',
                                     (int)tele_wfstate,
                                     (int)tele_front,
                                     (int)(mission_wallfollow == 2 ? tele_left
-                                                                  : tele_right));
+                                                                  : tele_right),
+                                    (int)safeLogFloat(idRoll),
+                                    (int)safeLogFloat(idPitch));
                     }
                 }
             }

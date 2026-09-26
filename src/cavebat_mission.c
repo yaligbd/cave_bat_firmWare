@@ -455,8 +455,24 @@ static void releaseToHighLevel(void) {
   vel_active = false;
   // Stop moving, and hold still long enough to actually be stopped. Relaxing
   // mid-slide hands over a velocity the planner does not know it must arrest.
-  sendBodyVelocity(0.0f, 0.0f, mission_height / 1000.0f, 0.0f);
-  vTaskDelay(M2T(400));
+  //
+  // The hold is RE-SENT every 20ms rather than sent once and waited out. A
+  // single setpoint followed by a silent delay is what made the aircraft sag
+  // about 20cm at the start of every return leg:
+  //
+  //   the supervisor treats a setpoint older than 500ms as a fault and forces
+  //   supervisorStateWarningLevelOut, which disables x and y control and
+  //   commands the aircraft level.
+  //
+  // One setpoint, then 400ms of silence, then a further 100ms for the loop to
+  // come round to the first goTo, put the age at just over 500ms -- tripping
+  // the watchdog at exactly the moment the return started. Refreshing keeps it
+  // under 20ms, so the aircraft is stopped by a command rather than by a
+  // supervisor that has given up on us.
+  for (uint8_t i = 0; i < 20; i++) {
+    sendBodyVelocity(0.0f, 0.0f, mission_height / 1000.0f, 0.0f);
+    vTaskDelay(M2T(20));
+  }
   commanderRelaxPriority();
   // Whatever heading it ended up on becomes the heading to hold from here.
   mission_yaw = wrapYaw(safeLogFloat(wf_idYaw) * DEG2RAD);

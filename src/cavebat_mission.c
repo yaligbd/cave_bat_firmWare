@@ -746,7 +746,28 @@ void appMain(void) {
         crumb_x = 0;
         crumb_y = 0;
         if (mission_wallfollow) {
-          wallFollowerInit(mission_walldist / 1000.0f, WF_SPEED_MS, forward);
+          // Start ALREADY FOLLOWING, not in `forward`.
+          //
+          // This matters more than it looks. The only way out of the `forward`
+          // state is the FRONT sensor seeing something within 60cm -- it does
+          // not look at the side sensor at all. Bitcraze's demo is launched in
+          // the middle of a room, so it flies forward, meets a wall ahead,
+          // turns to find it and then follows.
+          //
+          // CaveBat is launched with the wall already beside the drone and open
+          // space ahead, which is what the app's own instructions ask for. Told
+          // to start in `forward`, the machine therefore never left it: it flew
+          // straight at full speed past the wall it was supposed to follow
+          // until it hit something. That was three crashed flights.
+          //
+          // `forwardAlongWall` is the state that holds the distance and flies
+          // on, which is exactly the situation on the pad. If the wall turns
+          // out to be further than 70cm the machine drops into findCorner and
+          // searches for it, so a sloppy placement degrades into a search
+          // rather than a crash.
+          wallFollowerInit(mission_walldist / 1000.0f, WF_SPEED_MS,
+                           forwardAlongWall);
+          wf_state = forwardAlongWall;
         }
         climb_done_tick = xTaskGetTickCount()
                         + M2T((uint32_t)(takeoff_duration * 1000.0f));

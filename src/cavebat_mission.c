@@ -631,11 +631,34 @@ static void wfTick(void) {
                           frontRange, sideRange, yawRad, direction, now_s);
   tele_wfstate = (uint8_t)wf_state;
 
-  // Cap the rotation. See WF_MAX_YAWRATE_DEG for why turning slowly matters
-  // more here than turning quickly.
+  // Cap the rotation -- and slow the TRANSLATION by the same factor.
+  //
+  // Capping the turn rate alone was a real bug, and it cost two crashed
+  // corners. The follower does not pick a turn rate independently; around an
+  // outside corner it DERIVES one from the forward speed to fly a particular
+  // arc:
+  //
+  //     cmdVelX = maxForwardSpeed;
+  //     cmdAngW = direction * (-cmdVelX / radius);
+  //
+  // The radius is what matters -- it is set to the wall distance, so the
+  // aircraft curves around the corner at the range it was already holding.
+  // Clamping the yaw rate while leaving the speed alone changes that radius:
+  // 0.2 m/s against a 20 deg/s cap arcs at 0.57m instead of the 0.4m intended,
+  // so the aircraft runs wide and stops tracking the wall it is turning around.
+  //
+  // Scaling the velocity by the same factor keeps vx/omega, and therefore the
+  // radius, exactly as the controller intended. The corner is flown on the same
+  // path, just more slowly. States that rotate on the spot already have vx = 0,
+  // so scaling costs them nothing.
   float yawRateDeg = yawRateRad * RAD2DEG;
-  if (yawRateDeg >  WF_MAX_YAWRATE_DEG) yawRateDeg =  WF_MAX_YAWRATE_DEG;
-  if (yawRateDeg < -WF_MAX_YAWRATE_DEG) yawRateDeg = -WF_MAX_YAWRATE_DEG;
+  float yawMag = yawRateDeg < 0.0f ? -yawRateDeg : yawRateDeg;
+  if (yawMag > WF_MAX_YAWRATE_DEG) {
+    float scale = WF_MAX_YAWRATE_DEG / yawMag;
+    yawRateDeg *= scale;
+    vx *= scale;
+    vy *= scale;
+  }
 
   // Never fly into anything. Applied to the TARGET, so the ramp below
   // decelerates into the stop instead of snapping to it.
@@ -1178,7 +1201,14 @@ void appMain(void) {
                     // st is the follower's state: 0 forward, 1 hover,
                     // 2 turnToFindWall, 3 turnToAlignToWall, 4 forwardAlongWall,
                     // 5 rotateAroundWall, 6 rotateInCorner, 7 findCorner.
-                    if ((tele_alive % 10) == 0) {
+                    // Twice a second through a corner, once a second along a
+                    // wall. Corners are where this keeps failing and they last
+                    // three to five seconds, so four lines at 1Hz was not
+                    // enough to watch one go wrong -- but the straight
+                    // stretches are long and uneventful, and printing those
+                    // faster would crowd the link for nothing.
+                    uint16_t traceEvery = (wf_state == forwardAlongWall) ? 10 : 5;
+                    if ((tele_alive % traceEvery) == 0) {
                         DEBUG_PRINT("WF%c st=%d f=%d s=%d r=%d p=%d\n",
                                     (mission_wallfollow == 2) ? 'L' : 'R',
                                     (int)tele_wfstate,

@@ -259,7 +259,11 @@ static uint32_t mission_walldist = 400;
 // its transitions is driven by a MEASURED heading change or a range reading,
 // never by assuming a turn took a particular time -- so a slower turn simply
 // takes more ticks to satisfy the same condition.
-#define WF_MAX_YAWRATE_DEG  15.0f
+// 20, raised from 15 after flying it. 15 stopped the aircraft tilting through
+// corners, which was the point, but it turned visibly slower than it needed to
+// and every corner manoeuvre spends that time inside the outbound budget. 20 is
+// still well under Bitcraze's 29 and keeps most of the margin.
+#define WF_MAX_YAWRATE_DEG  20.0f
 
 // Drop a breadcrumb every time the drone has moved this far since the last
 // one. The old controller dropped one per completed hop; there are no hops

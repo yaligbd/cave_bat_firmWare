@@ -326,6 +326,39 @@ static float commandedHeight(void);
 // Where the last breadcrumb was dropped, mm.
 static int16_t crumb_x = 0, crumb_y = 0;
 
+// --- Smoothing the commanded speed ------------------------------------------
+//
+// How fast the commanded velocity is allowed to change, m/s per second.
+//
+// The wall follower's states hand back step changes: forwardAlongWall asks for
+// 0.2 m/s, rotateInCorner asks for 0, and the switch between them lands in a
+// single tick. A quadrotor obeys "stop now" by pitching up, which trades away
+// the vertical component of its thrust, so every one of those steps costs
+// altitude. That is the dip that remained at direction changes after the
+// braking phase fixed it for the return leg -- same fault, the rest of the
+// flight.
+//
+// Rate-limiting the commanded velocity fixes all of them at once instead of
+// special-casing each transition. At 0.4 m/s^2 a full stop from 0.2 m/s takes
+// half a second, which the aircraft can do on a gentle pitch.
+//
+// The obstacle clamp is applied to the TARGET, before this, so an obstacle
+// still stops the drone -- it just decelerates into the stop rather than
+// snapping. From 0.2 m/s that costs about 5cm, which is why WF_STOP_MM is 250
+// and not 150.
+#define WF_ACCEL_MS2     0.4f
+
+// The commanded velocity as last sent, which the ramp works from.
+static float vx_cmd = 0.0f, vy_cmd = 0.0f;
+
+// Speed when braking began, so the brake ramps down from whatever the aircraft
+// was actually doing rather than jumping back up to full speed first.
+static float brake_v0 = 0.0f;
+
+// True once the aircraft has turned back to its takeoff heading at the end of
+// the return leg.
+static bool home_turn_done = false;
+
 // Tick at which the braking phase began, so the ramp knows how far along it is.
 static TickType_t brake_start = 0;
 
@@ -604,10 +637,24 @@ static void wfTick(void) {
   if (yawRateDeg >  WF_MAX_YAWRATE_DEG) yawRateDeg =  WF_MAX_YAWRATE_DEG;
   if (yawRateDeg < -WF_MAX_YAWRATE_DEG) yawRateDeg = -WF_MAX_YAWRATE_DEG;
 
-  // Last word before the setpoint goes out: never fly into anything.
+  // Never fly into anything. Applied to the TARGET, so the ramp below
+  // decelerates into the stop instead of snapping to it.
   clampAwayFromObstacles(&vx, &vy);
 
-  sendBodyVelocity(vx, vy, commandedHeight(), yawRateDeg);
+  // Ease onto the new speed rather than stepping onto it. See WF_ACCEL_MS2:
+  // this is what stops the aircraft sagging every time the follower changes
+  // its mind about where to go.
+  float maxStep = WF_ACCEL_MS2 * 0.1f;   // decisions run at 10Hz
+  float dvx = vx - vx_cmd;
+  float dvy = vy - vy_cmd;
+  if (dvx >  maxStep) dvx =  maxStep;
+  if (dvx < -maxStep) dvx = -maxStep;
+  if (dvy >  maxStep) dvy =  maxStep;
+  if (dvy < -maxStep) dvy = -maxStep;
+  vx_cmd += dvx;
+  vy_cmd += dvy;
+
+  sendBodyVelocity(vx_cmd, vy_cmd, commandedHeight(), yawRateDeg);
 }
 
 // Give the aircraft back to the high-level commander.
@@ -966,6 +1013,10 @@ void appMain(void) {
         tele_wfstate = 0;
         crumb_x = 0;
         crumb_y = 0;
+        vx_cmd = 0.0f;
+        vy_cmd = 0.0f;
+        brake_v0 = 0.0f;
+        home_turn_done = false;
         if (mission_wallfollow) {
           // Start ALREADY FOLLOWING, not in `forward`.
           //
@@ -1078,17 +1129,20 @@ void appMain(void) {
                                 (int)tele_x, (int)tele_y);
                     tele_phase = PHASE_BRAKE;
                     brake_start = xTaskGetTickCount();
+                    brake_v0 = vx_cmd;   // ramp down from the real speed
                 } else if (waypoint_count >= MAX_WAYPOINTS) {
                     tele_outwhy = 4;
                     DEBUG_PRINT("CAVEBAT: breadcrumb trail full, returning\n");
                     tele_phase = PHASE_BRAKE;
                     brake_start = xTaskGetTickCount();
+                    brake_v0 = vx_cmd;   // ramp down from the real speed
                 } else if ((int32_t)(xTaskGetTickCount() - outbound_deadline) >= 0) {
                     tele_outwhy = 1;
                     DEBUG_PRINT("CAVEBAT: half timer, returning over %d points\n",
                                 (int)waypoint_count);
                     tele_phase = PHASE_BRAKE;
                     brake_start = xTaskGetTickCount();
+                    brake_v0 = vx_cmd;   // ramp down from the real speed
                 } else {
                     // Fly the wall. wfTick() reads the sensors, runs Bitcraze's
                     // state machine and sends the setpoint; the refresh at the
@@ -1155,8 +1209,12 @@ void appMain(void) {
                 float f = 1.0f - ((float)elapsed / (float)M2T(BRAKE_MS));
                 if (f < 0.0f) f = 0.0f;
                 vel_active = true;
-                sendBodyVelocity(WF_SPEED_MS * f, 0.0f,
-                                 commandedHeight(), 0.0f);
+                // From brake_v0, not WF_SPEED_MS. If the follower was already
+                // slowing -- mid-corner, say -- ramping from full speed would
+                // accelerate the aircraft before stopping it.
+                vx_cmd = brake_v0 * f;
+                vy_cmd = 0.0f;
+                sendBodyVelocity(vx_cmd, vy_cmd, commandedHeight(), 0.0f);
             } else {
                 // Stopped. Hand the aircraft back to the trajectory planner.
                 //
@@ -1186,8 +1244,30 @@ void appMain(void) {
             } else {
                 step_active = false;
                 if (return_index == 0) {
-                    DEBUG_PRINT("CAVEBAT: home, landing\n");
-                    tele_phase = PHASE_LANDING;
+                    // Home. Turn back to the heading it took off on before
+                    // landing.
+                    //
+                    // The return leg deliberately holds whatever heading the
+                    // outbound leg ended on, because rotating is what upsets
+                    // the Flow deck and rotating repeatedly along the way home
+                    // would cost position on every hop. The cost of that choice
+                    // is that the aircraft lands facing an arbitrary direction.
+                    //
+                    // So the rotation happens once, here, at the end: on the
+                    // pad, with nothing left to navigate to and nothing to hit.
+                    // Drift during this turn costs nothing, because the next
+                    // thing that happens is landing.
+                    if (!home_turn_done && waypoint_count > 0) {
+                        home_turn_done = true;
+                        DEBUG_PRINT("CAVEBAT: home, turning to takeoff heading\n");
+                        issueStep(waypoints[0].x / 1000.0f,
+                                  waypoints[0].y / 1000.0f,
+                                  waypoints[0].z / 1000.0f,
+                                  0.0f);
+                    } else {
+                        DEBUG_PRINT("CAVEBAT: home, landing\n");
+                        tele_phase = PHASE_LANDING;
+                    }
                 } else {
                     return_index--;
                     // Heading held, not recomputed. The drone is retracing

@@ -264,7 +264,12 @@ static uint32_t mission_walldist = 400;
 // Drop a breadcrumb every time the drone has moved this far since the last
 // one. The old controller dropped one per completed hop; there are no hops
 // any more, so distance is what marks the trail now.
-#define WF_CRUMB_MM      300
+// Halved from 300mm. The return flies straight lines between breadcrumbs, so
+// the spacing IS the resolution of the path home: at 300mm a flight that
+// rounded a corner was retraced as a shortcut across it, which is the "it went
+// a direct route instead of the exact way" that was reported. At 150mm the
+// trail bends where the flight bent.
+#define WF_CRUMB_MM      150
 
 // True while velocity setpoints are driving the aircraft. It gates the 100Hz
 // refresh at the foot of the loop, and it is how the return leg knows it has
@@ -282,7 +287,37 @@ static uint8_t tele_wfstate = 0;
 
 // The sensors the follower reads. File scope because it runs outside the
 // block where appMain keeps its own log handles.
-static logVarId_t wf_idFront, wf_idLeft, wf_idRight, wf_idYaw;
+static logVarId_t wf_idFront, wf_idLeft, wf_idRight, wf_idYaw, wf_idBack, wf_idUp;
+
+// --- Refusing to fly into things --------------------------------------------
+//
+// Anything closer than this in the direction of travel cancels movement that
+// way. Nothing else: the commanded velocity is only ever reduced, never
+// redirected.
+//
+// That restraint is the entire point. Every crash in this project came from
+// logic that decided to DO something clever near a wall -- turn toward it,
+// stop dead, hand over control -- and a layer that can only subtract cannot
+// invent a manoeuvre, cannot oscillate against the follower, and cannot fight
+// it for control. It composes with whatever the follower wants instead of
+// arguing with it.
+//
+// 250mm sits below everything the follower works to: it keeps 400mm off the
+// wall and calls a corner at 600mm ahead. So in normal flight this never
+// engages at all. It is what catches the case the follower got wrong -- like
+// flying into a dead end because the corner never triggered.
+#define WF_STOP_MM       250
+
+// A low ceiling pushes the flight down this far at most, mm. Anything more and
+// a bad up-reading could fly the aircraft into the floor.
+#define WF_CEIL_DROP_MM  250
+
+// Where the ceiling starts to matter, mm.
+#define WF_CEIL_MM       400
+
+// Defined further down, next to the rest of the velocity control; declared here
+// because dropBreadcrumb() records the height that is actually being flown.
+static float commandedHeight(void);
 
 // Where the last breadcrumb was dropped, mm.
 static int16_t crumb_x = 0, crumb_y = 0;
@@ -318,9 +353,20 @@ static float wrapYaw(float y) {
 static float last_turn_deg = 0.0f;
 
 // --- Breadcrumbs --------------------------------------------------------------
-// One saved position per hop. 64 is enough for about a minute of flying out.
-#define MAX_WAYPOINTS 64
-typedef struct { int16_t x, y; } Waypoint;
+//
+// The trail home. One saved position every WF_CRUMB_MM of travel.
+//
+// The height is stored with each one, not assumed. The outbound leg ducks under
+// a low ceiling, so a return flown at the requested altitude would climb back
+// into the roof it had just avoided. Retracing the height that was actually
+// flown is the only version of "go back the way you came" that is true in a
+// cave.
+//
+// Doubled to 128 when the spacing was halved, so the reachable range is
+// unchanged at about 19m of outbound path -- far more than any timer the app
+// offers can fly at 0.2 m/s. Costs 768 bytes of static RAM, not heap.
+#define MAX_WAYPOINTS 128
+typedef struct { int16_t x, y, z; } Waypoint;
 static Waypoint waypoints[MAX_WAYPOINTS];
 static uint16_t waypoint_count = 0;
 
@@ -391,7 +437,17 @@ static void issueStep(float tx_m, float ty_m, float tz_m, float yaw_rad) {
   float dy = ty_m - (tele_y / 1000.0f);
   float dist = sqrtf(dx * dx + dy * dy);
   float dur  = dist / STEP_SPEED_MS;
-  if (dur < 0.7f) dur = 0.7f;   // a floor, or short hops are commanded violently
+  // A floor, or short hops are commanded violently.
+  //
+  // 0.7s was too low once the trail became dense. A 300mm hop flown in 0.7s is
+  // 0.43 m/s -- more than TWICE the speed the outbound leg flies at -- so the
+  // aircraft left every breadcrumb by accelerating hard, and accelerating means
+  // tilting, and tilting costs altitude on a sagging pack. That is the drop
+  // still seen at the start of the return after the braking fix.
+  //
+  // At 1.5s a WF_CRUMB_MM hop is flown at the same speed as the outbound leg,
+  // which is what "go back the way you came" ought to mean.
+  if (dur < 1.5f) dur = 1.5f;
   // And a ceiling. Every target here is derived from the estimated position,
   // so if the estimate jumps the computed distance jumps with it, and without
   // this the drone would be commanded on one long uninterrupted flight to a
@@ -432,6 +488,8 @@ static void dropBreadcrumb(void) {
   if (waypoint_count < MAX_WAYPOINTS) {
     waypoints[waypoint_count].x = tele_x;
     waypoints[waypoint_count].y = tele_y;
+    // The height actually being flown, which a low ceiling may have lowered.
+    waypoints[waypoint_count].z = (int16_t)(commandedHeight() * 1000.0f);
     waypoint_count++;
   }
   crumb_x = tele_x;
@@ -473,6 +531,53 @@ static void sendBodyVelocity(float vx, float vy, float z_m, float yawRateDeg) {
 //
 // direction is +1 with the wall on the RIGHT and -1 with it on the LEFT, which
 // is the pairing Bitcraze's demo uses with the matching sensor.
+// Cancel any commanded motion that heads into something close.
+//
+// Body frame: vx forward, vy LEFT. So a positive vy is checked against the
+// left sensor and a negative one against the right.
+//
+// Only motion TOWARD an obstacle is removed. Motion away is untouched, which
+// matters more than it sounds: when the follower is hard against its wall it
+// answers by strafing away from it, and a clamp that blocked that would trap
+// the aircraft against the very thing it was trying to escape.
+//
+// A reading of exactly 0 is treated as "no reading" rather than "touching".
+// The raw sensors report 32767 when nothing is in range, so a real 0 is
+// almost unheard of -- but safeLogFloat() also returns 0 for a sensor that is
+// not fitted, and reading that as an obstacle would freeze a Multi-ranger-less
+// aircraft in place. Losing the 0mm case is the cheaper mistake by far.
+static void clampAwayFromObstacles(float *vx, float *vy) {
+  float f = safeLogFloat(wf_idFront);
+  float b = safeLogFloat(wf_idBack);
+  float l = safeLogFloat(wf_idLeft);
+  float r = safeLogFloat(wf_idRight);
+
+  if (*vx > 0.0f && f > 0.0f && f < (float)WF_STOP_MM) *vx = 0.0f;
+  if (*vx < 0.0f && b > 0.0f && b < (float)WF_STOP_MM) *vx = 0.0f;
+  if (*vy > 0.0f && l > 0.0f && l < (float)WF_STOP_MM) *vy = 0.0f;
+  if (*vy < 0.0f && r > 0.0f && r < (float)WF_STOP_MM) *vy = 0.0f;
+}
+
+// How high to fly right now, in metres.
+//
+// Normally the height the app asked for. Under a low ceiling, less: a cave
+// roof does not care what altitude was requested on the pad. Taken from
+// Bitcraze's own wall-following demo, which does exactly this with the up
+// ranger, and capped so that one bad reading cannot drive the aircraft into
+// the floor.
+static float commandedHeight(void) {
+  float h = mission_height / 1000.0f;
+  float up = safeLogFloat(wf_idUp);
+  if (up > 0.0f && up < (float)WF_CEIL_MM) {
+    float drop = ((float)WF_CEIL_MM - up) / 1000.0f;
+    if (drop > (float)WF_CEIL_DROP_MM / 1000.0f) {
+      drop = (float)WF_CEIL_DROP_MM / 1000.0f;
+    }
+    h -= drop;
+  }
+  return h;
+}
+
 static void wfTick(void) {
   float frontRange = safeLogFloat(wf_idFront) / 1000.0f;
   float sideRange  = (mission_wallfollow == 2 ? safeLogFloat(wf_idLeft)
@@ -495,7 +600,10 @@ static void wfTick(void) {
   if (yawRateDeg >  WF_MAX_YAWRATE_DEG) yawRateDeg =  WF_MAX_YAWRATE_DEG;
   if (yawRateDeg < -WF_MAX_YAWRATE_DEG) yawRateDeg = -WF_MAX_YAWRATE_DEG;
 
-  sendBodyVelocity(vx, vy, mission_height / 1000.0f, yawRateDeg);
+  // Last word before the setpoint goes out: never fly into anything.
+  clampAwayFromObstacles(&vx, &vy);
+
+  sendBodyVelocity(vx, vy, commandedHeight(), yawRateDeg);
 }
 
 // Give the aircraft back to the high-level commander.
@@ -521,7 +629,7 @@ static void releaseToHighLevel(void) {
   // stationary. The 400ms blocking wait this replaces was doing real harm: it
   // stopped the loop, so the recording and the tilt watch went blind for
   // exactly the window in which the aircraft started falling.
-  sendBodyVelocity(0.0f, 0.0f, mission_height / 1000.0f, 0.0f);
+  sendBodyVelocity(0.0f, 0.0f, commandedHeight(), 0.0f);
   commanderRelaxPriority();
   // Whatever heading it ended up on becomes the heading to hold from here.
   mission_yaw = wrapYaw(safeLogFloat(wf_idYaw) * DEG2RAD);
@@ -634,6 +742,8 @@ void appMain(void) {
   wf_idLeft  = idLeft;
   wf_idRight = idRight;
   wf_idYaw   = idYaw;
+  wf_idBack  = idBack;
+  wf_idUp    = idUp;
 
   DEBUG_PRINT("CAVEBAT: Flight & Telemetry starting\n");
   
@@ -1042,7 +1152,7 @@ void appMain(void) {
                 if (f < 0.0f) f = 0.0f;
                 vel_active = true;
                 sendBodyVelocity(WF_SPEED_MS * f, 0.0f,
-                                 mission_height / 1000.0f, 0.0f);
+                                 commandedHeight(), 0.0f);
             } else {
                 // Stopped. Hand the aircraft back to the trajectory planner.
                 //
@@ -1085,7 +1195,7 @@ void appMain(void) {
                     // heading so the map stays correct.
                     issueStep(waypoints[return_index].x / 1000.0f,
                               waypoints[return_index].y / 1000.0f,
-                              mission_height / 1000.0f,
+                              waypoints[return_index].z / 1000.0f,
                               mission_yaw);
                 }
             }

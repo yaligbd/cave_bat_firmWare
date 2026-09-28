@@ -442,6 +442,33 @@ static TickType_t brake_start = 0;
 #define WF_LOST_MS 10000
 static TickType_t last_following_tick = 0;
 
+// --- Stop flying the mission when the aircraft starts losing it -------------
+//
+// Tilt past this many degrees, for two ticks running, ends the flight: the
+// aircraft stops being asked to go anywhere and lands.
+//
+// WHY THIS RATHER THAN MORE TUNING. Every crash in this project has had the
+// same shape -- the aircraft gets into trouble and the firmware keeps flying
+// the mission at it until it is upside down. The last one went from 16 degrees
+// of yaw to 136 degrees per second in under a second while still being told to
+// strafe toward a wall it had lost.
+//
+// A cave mapper that follows a wall for twenty seconds, gets confused and
+// comes home has done its job. One that tries heroically to round every corner
+// and ends on its back has not, and it cannot be downloaded from a wall.
+//
+// So the demand is removed at the first sign of trouble. If the controller is
+// chasing a position estimate it cannot trust, taking away the target is
+// exactly what stops the chase; if it has hit something, nothing was going to
+// help anyway and landing is still the least bad answer.
+//
+// 30 degrees is far beyond normal -- healthy flights record 0 to 2, and even
+// aggressive corners stay under 15 -- but well short of the 65 to 74 seen once
+// a tumble is already unrecoverable.
+#define TILT_ABORT_DEG   30.0f
+#define TILT_ABORT_TICKS 2
+static uint8_t tilt_streak = 0;
+
 // Worst tilt since the last sample, 2-degree units. See FlightSample.tilt.
 static uint8_t tilt_peak = 0;
 
@@ -1067,11 +1094,29 @@ void appMain(void) {
       if (roll_now < 0) roll_now = -roll_now;
       if (pitch_now < 0) pitch_now = -pitch_now;
       // Worst tilt this second, held until the next sample takes it.
+      float worst = (roll_now > pitch_now) ? roll_now : pitch_now;
       {
-        float worst = (roll_now > pitch_now) ? roll_now : pitch_now;
         uint16_t units = (uint16_t)(worst / 2.0f);
         if (units > 255) units = 255;
         if ((uint8_t)units > tilt_peak) tilt_peak = (uint8_t)units;
+      }
+
+      // Losing it. Stop flying the mission and put it down.
+      //
+      // Suppressed until the climb is over, like the other guards: the
+      // aircraft tilts on the way up and the estimator is least trustworthy
+      // there, which is the worst possible moment to react to it.
+      if (worst > TILT_ABORT_DEG
+          && (int32_t)(xTaskGetTickCount() - climb_done_tick) >= 0) {
+        if (tilt_streak < 255) tilt_streak++;
+      } else {
+        tilt_streak = 0;
+      }
+      if (tilt_streak >= TILT_ABORT_TICKS && tele_phase != PHASE_LANDING) {
+        DEBUG_PRINT("CAVEBAT: tilt %d deg, abandoning mission and landing\n",
+                    (int)worst);
+        tele_endwhy = 3;
+        tele_phase = PHASE_LANDING;
       }
       // 5Hz, not the full 10.
       //
@@ -1240,6 +1285,8 @@ void appMain(void) {
         crumb_x = 0;
         crumb_y = 0;
         vx_cmd = 0.0f;
+        tilt_streak = 0;
+        tilt_peak = 0;
         vy_cmd = 0.0f;
         brake_v0 = 0.0f;
         home_turn_done = false;

@@ -392,6 +392,38 @@ static bool home_turn_done = false;
 // Tick at which the braking phase began, so the ramp knows how far along it is.
 static TickType_t brake_start = 0;
 
+// --- Giving up on a corner ---------------------------------------------------
+//
+// Tick at which the follower was last actually following a wall, and how long
+// it may spend away from that before the mission gives up and flies home.
+//
+// WHY. A downloaded flight showed the whole failure. Five seconds of
+// forwardAlongWall holding the wall at 280-420mm, exactly as intended. Then the
+// wall was lost at one corner -- and the follower never reached
+// forwardAlongWall again for the remaining twenty-one seconds. It cycled
+// findCorner, rotateAroundWall, turnToAlignToWall, rotateInCorner, back to
+// rotateAroundWall, yaw swinging 8 -> 33 -> 84 -> 7 -> 66 degrees, turning
+// continuously until it turned into something.
+//
+// The corner states have no collective timeout. Individually each is
+// reasonable; together they can form a loop with no exit, because every one of
+// them is waiting for a wall that searching is not finding. Altitude held at
+// ~500mm through all of it and only collapsed at the very end, so the sag that
+// looks like the fault is a symptom of twenty seconds of manoeuvring, not its
+// cause.
+//
+// Rather than tune the corner geometry again -- twice now that has fixed one
+// case and broken another -- this makes losing the wall SAFE. A corner that
+// cannot be completed in WF_LOST_MS stops being a corner and becomes a reason
+// to come home, which is the right answer for an aircraft whose job is to map
+// a cave and get back.
+//
+// 10s is comfortably longer than a real corner, which needs about 5 to 6: a 46
+// degree rotation at 25 deg/s, a one second measurement pause, then finding
+// and re-aligning to the wall.
+#define WF_LOST_MS 10000
+static TickType_t last_following_tick = 0;
+
 // The heading the RETURN leg is holding, in radians. Bookkeeping for
 // issueStep, which needs to know the heading it last commanded so it can work
 // out how long a turn should take. 0 = the way the drone faced at takeoff.
@@ -674,6 +706,10 @@ static void wfTick(void) {
   wf_state = wallFollower(&vx, &vy, &yawRateRad,
                           frontRange, sideRange, yawRad, direction, now_s);
   tele_wfstate = (uint8_t)wf_state;
+
+  // The one state meaning "a wall is beside me and I am following it".
+  // Everything else is searching for one, and searching has a time limit.
+  if (wf_state == forwardAlongWall) last_following_tick = xTaskGetTickCount();
 
   // Cap the rotation -- and slow the TRANSLATION by the same factor.
   //
@@ -1251,6 +1287,8 @@ void appMain(void) {
                                       + M2T((mission_timer * 1000) / 2);
                     // Where we started, so the trail always ends at the pad.
                     dropBreadcrumb();
+                    // Starts now, not at takeoff: the climb is not searching.
+                    last_following_tick = xTaskGetTickCount();
                     DEBUG_PRINT("CAVEBAT: outbound, following wall on the %s\n",
                                 mission_wallfollow == 2 ? "LEFT" : "RIGHT");
                 } else {
@@ -1283,7 +1321,20 @@ void appMain(void) {
                 // whenever the current hop happened to end. Order matters: the
                 // geofence outranks the clock, because too far is a safety
                 // limit while time is up is only a plan.
-                if (beyondGeofence()) {
+                // GAVE UP ON A CORNER. Checked first, because an aircraft
+                // that has stopped following a wall is not doing the mission
+                // any more -- it is turning in circles looking for one, and
+                // every other reason to go home assumes it is still flying a
+                // sensible path. See WF_LOST_MS.
+                if ((int32_t)(xTaskGetTickCount() - last_following_tick)
+                      >= (int32_t)M2T(WF_LOST_MS)) {
+                    tele_outwhy = 5;
+                    DEBUG_PRINT("CAVEBAT: lost the wall for %ds, going home\n",
+                                (int)(WF_LOST_MS / 1000));
+                    tele_phase = PHASE_BRAKE;
+                    brake_v0 = vx_cmd;
+                    brake_start = xTaskGetTickCount();
+                } else if (beyondGeofence()) {
                     tele_outwhy = 2;
                     DEBUG_PRINT("CAVEBAT: geofence at %d,%d mm, returning\n",
                                 (int)tele_x, (int)tele_y);

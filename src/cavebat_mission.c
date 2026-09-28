@@ -285,7 +285,15 @@ static uint32_t mission_walldist = 400;
 // corners, which was the point, but it turned visibly slower than it needed to
 // and every corner manoeuvre spends that time inside the outbound budget. 20 is
 // still well under Bitcraze's 29 and keeps most of the margin.
-#define WF_MAX_YAWRATE_DEG  20.0f
+// 25, raised from 20 once the velocity was scaled along with it.
+//
+// The cap was originally there to stop the aircraft tilting through turns, and
+// 15 then 20 were chosen while the cap was being applied to the rotation ALONE
+// -- which quietly widened every corner arc and crashed two flights. Now that
+// speed scales with it the arc radius is right at any cap, so the only thing
+// the number controls is how long a corner takes. 25 is close to Bitcraze's
+// own 28.6 and gives most of that time back.
+#define WF_MAX_YAWRATE_DEG  25.0f
 
 // Drop a breadcrumb every time the drone has moved this far since the last
 // one. The old controller dropped one per completed hop; there are no hops
@@ -425,7 +433,13 @@ static float last_turn_deg = 0.0f;
 // unchanged at about 19m of outbound path -- far more than any timer the app
 // offers can fly at 0.2 m/s. Costs 768 bytes of static RAM, not heap.
 #define MAX_WAYPOINTS 128
-typedef struct { int16_t x, y, z; } Waypoint;
+typedef struct {
+  int16_t x, y, z;
+  // How far the followed wall was when this crumb was dropped, mm, or 0 if it
+  // was out of range. This is what makes the return self-correcting: see
+  // wallCorrection().
+  int16_t side;
+} Waypoint;
 static Waypoint waypoints[MAX_WAYPOINTS];
 static uint16_t waypoint_count = 0;
 
@@ -549,6 +563,14 @@ static void dropBreadcrumb(void) {
     waypoints[waypoint_count].y = tele_y;
     // The height actually being flown, which a low ceiling may have lowered.
     waypoints[waypoint_count].z = (int16_t)(commandedHeight() * 1000.0f);
+    // The raw followed-side reading, NOT tele_*, because clampRange() turns
+    // out-of-range into 0 and this needs to tell "far" from "no reading".
+    {
+      float sideRaw = (mission_wallfollow == 2) ? safeLogFloat(wf_idLeft)
+                                                : safeLogFloat(wf_idRight);
+      waypoints[waypoint_count].side =
+        (sideRaw > 0.0f && sideRaw < 3000.0f) ? (int16_t)sideRaw : 0;
+    }
     waypoint_count++;
   }
   crumb_x = tele_x;
@@ -700,6 +722,85 @@ static void wfTick(void) {
   vy_cmd += dvy;
 
   sendBodyVelocity(vx_cmd, vy_cmd, commandedHeight(), yawRateDeg);
+}
+
+// --- Using the wall on the way home -----------------------------------------
+//
+// How far sideways to shift the next return target, in metres, so that the
+// aircraft ends up the same distance from the wall as it was on the way out.
+//
+// WHY THE RETURN NEEDED THIS. Until now the way home was pure dead reckoning:
+// fly to a list of positions the Flow deck reported earlier, without looking at
+// anything. That trusts the position estimate completely, and the Flow deck
+// drifts -- so the aircraft faithfully replays a path that no longer matches
+// the room, and has no way to notice, because it is not looking.
+//
+// But it IS still beside the wall it followed out. The heading is held through
+// the whole return, so the wall stays on the same side, and each breadcrumb
+// recorded how far away it was at that point. Comparing the live reading with
+// the recorded one measures the drift perpendicular to the wall directly, and
+// that is the component dead reckoning gets wrong first.
+//
+// Conservative on purpose: it does nothing unless both readings are real,
+// ignores differences under 50mm as noise, and never shifts a target by more
+// than WF_FIX_MAX_MM. A correction is only ever a nudge toward what the wall
+// says -- a wrong one must not be able to fly the aircraft into it.
+#define WF_FIX_MIN_MM   50
+#define WF_FIX_MAX_MM  250
+
+static float wallCorrection(int16_t recordedSide) {
+  if (!mission_wallfollow) return 0.0f;          // hover has no wall
+  if (recordedSide <= 0) return 0.0f;            // nothing was seen back then
+
+  float live = (mission_wallfollow == 2) ? safeLogFloat(wf_idLeft)
+                                         : safeLogFloat(wf_idRight);
+  if (live <= 0.0f || live >= 3000.0f) return 0.0f;   // nothing seen now
+
+  float err = live - (float)recordedSide;        // +ve = further away than before
+  float mag = err < 0.0f ? -err : err;
+  if (mag < (float)WF_FIX_MIN_MM) return 0.0f;   // noise
+  if (err >  (float)WF_FIX_MAX_MM) err =  (float)WF_FIX_MAX_MM;
+  if (err < -(float)WF_FIX_MAX_MM) err = -(float)WF_FIX_MAX_MM;
+
+  // Body +y is LEFT. Following on the left, being too far away means moving
+  // +y to close up; following on the right it means moving -y. Returned in
+  // metres along body y.
+  float sign = (mission_wallfollow == 2) ? 1.0f : -1.0f;
+  return sign * err / 1000.0f;
+}
+
+// Is the way to the next return target clear?
+//
+// The return leg flies goTo hops, which belong to the trajectory planner, so
+// the velocity clamp that protects wall following cannot reach them. That left
+// the whole way home with no obstacle protection at all -- and the aircraft
+// flies it sideways or backwards, so its front sensor is not even pointed where
+// it is going.
+//
+// This checks the sensor that faces the direction of travel before committing
+// to a hop. It does not steer around anything; it refuses to set off. Given the
+// path was flown minutes earlier, anything in the way now is either new or
+// means the position estimate has drifted enough that the path is wrong -- and
+// in both cases not moving is the right answer.
+static bool returnPathClear(float dx_m, float dy_m) {
+  // The intended move, rotated from world into the body frame the sensors live
+  // in. Heading is held through the return, so this is mission_yaw.
+  float c = cosf(mission_yaw), s = sinf(mission_yaw);
+  float fwd  =  dx_m * c + dy_m * s;   // +ve = forwards
+  float left = -dx_m * s + dy_m * c;   // +ve = to the left
+
+  // Only the dominant axis is checked. A hop is one short straight line, and
+  // the sensor facing most nearly along it is the one that can see what is
+  // there.
+  float range;
+  if ((fwd < 0 ? -fwd : fwd) >= (left < 0 ? -left : left)) {
+    range = (fwd >= 0.0f) ? safeLogFloat(wf_idFront) : safeLogFloat(wf_idBack);
+  } else {
+    range = (left >= 0.0f) ? safeLogFloat(wf_idLeft) : safeLogFloat(wf_idRight);
+  }
+  // A reading of exactly 0 means the sensor is absent, not touching -- see
+  // clampAwayFromObstacles for why that distinction matters.
+  return !(range > 0.0f && range < (float)WF_STOP_MM);
 }
 
 // Give the aircraft back to the high-level commander.
@@ -1343,10 +1444,39 @@ void appMain(void) {
                     // flies home sideways or backwards, which the aircraft
                     // does perfectly well, and every sample still carries the
                     // heading so the map stays correct.
-                    issueStep(waypoints[return_index].x / 1000.0f,
-                              waypoints[return_index].y / 1000.0f,
-                              waypoints[return_index].z / 1000.0f,
-                              mission_yaw);
+                    {
+                        float tx = waypoints[return_index].x / 1000.0f;
+                        float ty = waypoints[return_index].y / 1000.0f;
+
+                        // Correct the target sideways by what the wall says.
+                        // Dead reckoning alone replays the Flow deck's drift;
+                        // the wall is the one thing out here that has not
+                        // moved.
+                        float fix = wallCorrection(waypoints[return_index].side);
+                        if (fix != 0.0f) {
+                            // Body +y (left) expressed in world coordinates.
+                            tx += fix * -sinf(mission_yaw);
+                            ty += fix *  cosf(mission_yaw);
+                            DEBUG_PRINT("RTN fix %dmm\n", (int)(fix * 1000.0f));
+                        }
+
+                        float dx = tx - (tele_x / 1000.0f);
+                        float dy = ty - (tele_y / 1000.0f);
+
+                        if (!returnPathClear(dx, dy)) {
+                            // Something is in the way. Do not set off: hold
+                            // position and look again next tick. return_index
+                            // is put back so this waypoint is retried rather
+                            // than skipped -- skipping it would cut a corner
+                            // through whatever is blocking the path.
+                            return_index++;
+                            DEBUG_PRINT("RTN blocked, holding\n");
+                        } else {
+                            issueStep(tx, ty,
+                                      waypoints[return_index].z / 1000.0f,
+                                      mission_yaw);
+                        }
+                    }
                 }
             }
         }

@@ -255,6 +255,51 @@ static float turn_target = 0.0f;
 // cave is no use, even if the ground it picks is flat.
 static bool force_breadcrumbs = false;
 
+// --- Knowing it is home without trusting where it thinks it is --------------
+//
+// How far the aircraft has actually travelled, mm, accumulated from per-tick
+// position changes: once on the way out, once on the way back.
+//
+// WHY BOTHER, when the position estimate already says where home is. Because
+// after forty seconds and a 180-degree pivot it does not. Absolute position
+// drifts mostly through heading error, which integrates: a small yaw bias
+// bends the whole path, and by the time the aircraft flies back to "0,0" that
+// point is metres from the pad. That is why it landed well away from where it
+// started.
+//
+// Travelled distance is a sum of short steps. Each step is measured over 100ms
+// during which the heading barely moves, so the bias that ruins absolute
+// position barely touches it. It cannot say WHERE the aircraft is -- but it
+// says accurately how far it has come, and coming back as far as it went out
+// is a good definition of home when following the same wall both ways.
+//
+// Used alongside the position check, not instead of it: whichever fires first
+// ends the flight, because overshooting home is worse than stopping short.
+static int32_t outbound_travel_mm = 0;
+static int32_t home_travel_mm = 0;
+static int16_t travel_last_x = 0, travel_last_y = 0;
+
+static void accumulateTravel(int32_t *into) {
+  int32_t dx = (int32_t)tele_x - (int32_t)travel_last_x;
+  int32_t dy = (int32_t)tele_y - (int32_t)travel_last_y;
+  travel_last_x = tele_x;
+  travel_last_y = tele_y;
+  int32_t d2 = dx * dx + dy * dy;
+  if (d2 <= 0) return;
+  // Integer square root, good enough for a running total and cheaper than
+  // dragging floating point into a 10Hz loop for it.
+  int32_t r = 0, bit = 1 << 14;
+  while (bit > d2) bit >>= 2;
+  while (bit != 0) {
+    if (d2 >= r + bit) { d2 -= r + bit; r = (r >> 1) + bit; }
+    else r >>= 1;
+    bit >>= 2;
+  }
+  // A single tick cannot legitimately cover more than a few centimetres at
+  // 0.2 m/s, so anything larger is an estimator jump rather than travel.
+  if (r < 100) *into += r;
+}
+
 // Distance to keep from the wall, mm. Set by the app.
 static uint32_t mission_walldist = 400;
 
@@ -1470,6 +1515,10 @@ void appMain(void) {
         // Starts as what was asked for; flips at the turnaround.
         active_follow = mission_wallfollow;
         force_breadcrumbs = false;
+        outbound_travel_mm = 0;
+        home_travel_mm = 0;
+        travel_last_x = 0;
+        travel_last_y = 0;
         turn_target = 0.0f;
         vy_cmd = 0.0f;
         brake_v0 = 0.0f;
@@ -1544,8 +1593,18 @@ void appMain(void) {
                     waypoint_count = 0;
                     // Half the timer out, half back. The return is never given
                     // less time than the outbound leg took.
-                    outbound_deadline = xTaskGetTickCount()
-                                      + M2T((mission_timer * 1000) / 2);
+                    // Half the REMAINING time, not half the timer.
+                    //
+                    // The turnaround costs about eight seconds and used to
+                    // come out of the return leg alone, so the aircraft ran
+                    // out of time before it got back and landed well short.
+                    // Taking it off the top gives both legs the same budget.
+                    {
+                      uint32_t total = mission_timer * 1000;
+                      uint32_t usable = (total > TURNAROUND_MS + 4000)
+                                          ? (total - TURNAROUND_MS) : (total / 2);
+                      outbound_deadline = xTaskGetTickCount() + M2T(usable / 2);
+                    }
                     // Where we started, so the trail always ends at the pad.
                     dropBreadcrumb();
                     // Starts now, not at takeoff: the climb is not searching.
@@ -1600,11 +1659,19 @@ void appMain(void) {
                 // demanding precision would leave it hunting for a spot it
                 // cannot find. Landing slightly off beats circling.
                 int64_t hx = tele_x, hy = tele_y;
-                if (homebound &&
-                    (hx * hx + hy * hy) <= (int64_t)HOME_RADIUS_MM * (int64_t)HOME_RADIUS_MM) {
+                bool posSaysHome =
+                    (hx * hx + hy * hy) <= (int64_t)HOME_RADIUS_MM * (int64_t)HOME_RADIUS_MM;
+                // Come back as far as it went out. Independent of where it
+                // thinks it is, which after a 180 is the least reliable number
+                // on the aircraft.
+                bool travelSaysHome =
+                    outbound_travel_mm > 0 && home_travel_mm >= outbound_travel_mm;
+                if (homebound && (posSaysHome || travelSaysHome)) {
                     tele_outwhy = 6;
-                    DEBUG_PRINT("CAVEBAT: home at %d,%d mm, landing\n",
-                                (int)tele_x, (int)tele_y);
+                    DEBUG_PRINT("CAVEBAT: home (%s) at %d,%d mm, out %d back %d\n",
+                                posSaysHome ? "position" : "distance",
+                                (int)tele_x, (int)tele_y,
+                                (int)outbound_travel_mm, (int)home_travel_mm);
                     tele_phase = PHASE_LANDING;
                 } else if ((int32_t)(xTaskGetTickCount() - last_following_tick)
                       >= (int32_t)M2T(WF_LOST_MS)) {
@@ -1648,6 +1715,7 @@ void appMain(void) {
                     // foot of the loop keeps that setpoint alive at 100Hz.
                     vel_active = true;
                     wfTick();
+                    accumulateTravel(homebound ? &home_travel_mm : &outbound_travel_mm);
 
                     // Mark the trail by distance travelled. The return leg
                     // retraces these, so they have to be close enough together
@@ -1793,6 +1861,11 @@ void appMain(void) {
                     last_following_tick = xTaskGetTickCount();
                     vx_cmd = 0.0f;
                     vy_cmd = 0.0f;
+                    // The return's odometry starts here, from where the turn
+                    // finished, so the pivot itself is not counted as travel.
+                    home_travel_mm = 0;
+                    travel_last_x = tele_x;
+                    travel_last_y = tele_y;
                     tele_phase = PHASE_HOMEBOUND;
                     DEBUG_PRINT("CAVEBAT: round, following wall on the %s home\n",
                                 active_follow == 2 ? "LEFT" : "RIGHT");

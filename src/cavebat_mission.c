@@ -886,7 +886,18 @@ void appMain(void) {
       float pitch_now = safeLogFloat(idPitch);
       if (roll_now < 0) roll_now = -roll_now;
       if (pitch_now < 0) pitch_now = -pitch_now;
-      if (roll_now > 15.0f || pitch_now > 15.0f) {
+      // 5Hz, not the full 10.
+      //
+      // The console shares a 20-byte BLE link with two 5Hz log blocks and a
+      // 1Hz one, and it is already losing lines: a flight arrived with no
+      // "Initiating Takeoff", no "following wall on the LEFT" and none of the
+      // WF trace, alongside the drone's own "LOG packets drop detected". A
+      // tilt line ten times a second is the heaviest thing here and it fires
+      // exactly when the other lines matter most.
+      //
+      // Halving it still gives two or three lines across a flip, which is
+      // enough to tell a controller winding up from something letting go.
+      if ((roll_now > 15.0f || pitch_now > 15.0f) && (tele_alive % 2) == 0) {
         DEBUG_PRINT("TILT r=%d p=%d z=%d\n",
                     (int)safeLogFloat(idRoll), (int)safeLogFloat(idPitch),
                     (int)tele_z);

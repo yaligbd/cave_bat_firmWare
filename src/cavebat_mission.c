@@ -339,7 +339,7 @@ static uint8_t tele_wfstate = 0;
 
 // The sensors the follower reads. File scope because it runs outside the
 // block where appMain keeps its own log handles.
-static logVarId_t wf_idFront, wf_idLeft, wf_idRight, wf_idYaw, wf_idBack, wf_idUp;
+static logVarId_t wf_idFront, wf_idLeft, wf_idRight, wf_idYaw, wf_idBack, wf_idUp, wf_idDown;
 
 // --- Refusing to fly into things --------------------------------------------
 //
@@ -726,8 +726,72 @@ static void clampAwayFromObstacles(float *vx, float *vy) {
 // Bitcraze's own wall-following demo, which does exactly this with the up
 // ranger, and capped so that one bad reading cannot drive the aircraft into
 // the floor.
+// --- Terrain, and why stairs break a Crazyflie ------------------------------
+//
+// The altitude controller holds stateEstimate.z, and the estimator builds that
+// almost entirely from the downward laser. That works because it assumes the
+// floor is flat and at zero. A staircase breaks the assumption directly: fly
+// over a riser and the laser shortens by 170mm in one reading, the estimator
+// concludes the aircraft just DROPPED 170mm, and the controller hauls it up
+// to correct a fall that never happened. Fly off the top and the reverse.
+//
+// So the aircraft already terrain-follows -- badly. The problem is not that it
+// ignores the step, it is that it reacts to the whole step instantly, and the
+// estimator reports "State out of bounds, resetting" when the discontinuity is
+// large enough. A reset mid-flight throws away the position the breadcrumbs
+// and the way home depend on.
+//
+// This converts the step into a ramp. When the laser jumps by more than a
+// stair-sized amount in one tick, that is terrain rather than noise, and the
+// commanded height is moved by the SAME amount immediately -- which cancels
+// the error the controller was about to chase. The offset then decays back to
+// zero at a limited rate, so the aircraft re-acquires its requested clearance
+// smoothly over about half a second instead of lurching.
+//
+// The threshold sits above sensor noise (tens of mm) and below a stair riser
+// (about 170mm), so ordinary drift is left to the estimator and only real
+// terrain moves the setpoint.
+#define AGL_STEP_MM   80.0f     // a change this big in one tick is terrain
+#define AGL_SLEW_MS    0.30f    // how fast the offset is given back, m/s
+#define AGL_MAX_M      0.40f    // never chase more terrain than this at once
+
+static float terrain_offset_m = 0.0f;
+static float last_zrange_mm = 0.0f;
+
+static void terrainTick(void) {
+  float zr = safeLogFloat(wf_idDown);
+  // 0 means no reading, not zero height. Forget the history too, or the next
+  // valid reading looks like an enormous step.
+  if (zr <= 0.0f || zr > 3000.0f) {
+    last_zrange_mm = 0.0f;
+    return;
+  }
+
+  if (last_zrange_mm > 0.0f) {
+    float jump = zr - last_zrange_mm;
+    float mag = jump < 0.0f ? -jump : jump;
+    if (mag > AGL_STEP_MM) {
+      // Cancel the transient. Floor rises -> laser shortens -> jump negative
+      // -> commanded height drops by the same amount, so the controller sees
+      // no error to fight.
+      terrain_offset_m += jump / 1000.0f;
+      if (terrain_offset_m >  AGL_MAX_M) terrain_offset_m =  AGL_MAX_M;
+      if (terrain_offset_m < -AGL_MAX_M) terrain_offset_m = -AGL_MAX_M;
+      DEBUG_PRINT("TERRAIN step %dmm\n", (int)jump);
+    }
+  }
+  last_zrange_mm = zr;
+
+  // Give the offset back gradually, so the aircraft climbs the step rather
+  // than being snapped up it.
+  float step = AGL_SLEW_MS * 0.1f;          // per 10Hz tick, metres
+  if (terrain_offset_m >  step)      terrain_offset_m -= step;
+  else if (terrain_offset_m < -step) terrain_offset_m += step;
+  else                               terrain_offset_m = 0.0f;
+}
+
 static float commandedHeight(void) {
-  float h = mission_height / 1000.0f;
+  float h = mission_height / 1000.0f + terrain_offset_m;
   float up = safeLogFloat(wf_idUp);
   if (up > 0.0f && up < (float)WF_CEIL_MM) {
     float drop = ((float)WF_CEIL_MM - up) / 1000.0f;
@@ -1025,6 +1089,7 @@ void appMain(void) {
   wf_idYaw   = idYaw;
   wf_idBack  = idBack;
   wf_idUp    = idUp;
+  wf_idDown  = idDown;
 
   DEBUG_PRINT("CAVEBAT: Flight & Telemetry starting\n");
   
@@ -1099,6 +1164,13 @@ void appMain(void) {
         uint16_t units = (uint16_t)(worst / 2.0f);
         if (units > 255) units = 255;
         if ((uint8_t)units > tilt_peak) tilt_peak = (uint8_t)units;
+      }
+
+      // Follow the terrain. Suppressed until the climb is over: the aircraft
+      // is changing height on purpose up there, and a climb looks exactly like
+      // a floor falling away.
+      if ((int32_t)(xTaskGetTickCount() - climb_done_tick) >= 0) {
+        terrainTick();
       }
 
       // Losing it. Stop flying the mission and put it down.
@@ -1287,6 +1359,8 @@ void appMain(void) {
         vx_cmd = 0.0f;
         tilt_streak = 0;
         tilt_peak = 0;
+        terrain_offset_m = 0.0f;
+        last_zrange_mm = 0.0f;
         vy_cmd = 0.0f;
         brake_v0 = 0.0f;
         home_turn_done = false;

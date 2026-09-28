@@ -246,6 +246,15 @@ static uint8_t active_follow = 0;
 // Heading to reach before the turnaround is complete, radians.
 static float turn_target = 0.0f;
 
+// Set when following the wall home has failed, so the braking phase falls back
+// to the breadcrumb trail instead of trying to turn round again.
+//
+// The way home is a cascade, not a single plan: follow the wall back, and if
+// that fails fly the recorded positions back. Landing where it happens to be
+// is not one of the options -- an aircraft that gives up in the middle of a
+// cave is no use, even if the ground it picks is flat.
+static bool force_breadcrumbs = false;
+
 // Distance to keep from the wall, mm. Set by the app.
 static uint32_t mission_walldist = 400;
 
@@ -703,6 +712,30 @@ static void dropBreadcrumb(void) {
   }
   crumb_x = tele_x;
   crumb_y = tele_y;
+}
+
+// Which breadcrumb is closest to where the aircraft is now.
+//
+// The trail runs from the pad (index 0) outwards, and the way home is to walk
+// it backwards. Starting that walk at the LAST crumb is right when the
+// fallback happens at the far end of the outbound leg -- but wrong if it
+// happens halfway home, because the newest crumbs are then behind the aircraft
+// and it would fly back out to the far end before turning round again.
+//
+// Rejoining at the nearest point is what a person reading a map would do.
+static uint16_t nearestWaypoint(void) {
+  uint16_t best = 0;
+  int64_t bestDist = -1;
+  for (uint16_t i = 0; i < waypoint_count; i++) {
+    int64_t dx = (int64_t)tele_x - (int64_t)waypoints[i].x;
+    int64_t dy = (int64_t)tele_y - (int64_t)waypoints[i].y;
+    int64_t d = dx * dx + dy * dy;
+    if (bestDist < 0 || d < bestDist) {
+      bestDist = d;
+      best = i;
+    }
+  }
+  return best;
 }
 
 // --- Flying on velocity, for the wall follower ------------------------------
@@ -1436,6 +1469,7 @@ void appMain(void) {
         last_step_tick = 0;
         // Starts as what was asked for; flips at the turnaround.
         active_follow = mission_wallfollow;
+        force_breadcrumbs = false;
         turn_target = 0.0f;
         vy_cmd = 0.0f;
         brake_v0 = 0.0f;
@@ -1580,14 +1614,13 @@ void appMain(void) {
                     tele_outwhy = 5;
                     DEBUG_PRINT("CAVEBAT: lost the wall for %ds, %s\n",
                                 (int)(WF_LOST_MS / 1000),
-                                homebound ? "landing" : "going home");
-                    if (homebound) {
-                        tele_phase = PHASE_LANDING;
-                    } else {
-                        tele_phase = PHASE_BRAKE;
-                        brake_v0 = vx_cmd;
-                        brake_start = xTaskGetTickCount();
-                    }
+                                homebound ? "breadcrumbs home" : "going home");
+                    // Losing the wall on the way home does not end the
+                    // flight -- it drops to the next way of getting home.
+                    if (homebound) force_breadcrumbs = true;
+                    tele_phase = PHASE_BRAKE;
+                    brake_v0 = vx_cmd;
+                    brake_start = xTaskGetTickCount();
                 } else if (beyondGeofence()) {
                     tele_outwhy = 2;
                     DEBUG_PRINT("CAVEBAT: geofence at %d,%d mm, returning\n",
@@ -1703,7 +1736,7 @@ void appMain(void) {
                 // exactly this: it tells the planner the live state estimate
                 // and drops the priority in one go, so the next goTo plans
                 // from where the aircraft actually is.
-                if (active_follow) {
+                if (active_follow && !force_breadcrumbs) {
                     // TURN ROUND AND FOLLOW THE WALL BACK.
                     //
                     // No handover at all: the aircraft stays under velocity
@@ -1718,7 +1751,11 @@ void appMain(void) {
                     // following was never on. Breadcrumbs are all there is.
                     releaseToHighLevel();
                     step_active = false;
-                    return_index = waypoint_count;   // decremented before first use
+                    // Rejoin the trail where the aircraft actually is, then
+                    // walk it back to the pad. +1 because the step below
+                    // decrements before using it.
+                    return_index = (uint16_t)(nearestWaypoint() + 1);
+                    if (return_index > waypoint_count) return_index = waypoint_count;
                     tele_phase = PHASE_RETURN;
                     DEBUG_PRINT("CAVEBAT: stopped, home over %d pts\n",
                                 (int)waypoint_count);
@@ -1741,9 +1778,12 @@ void appMain(void) {
 
             if (mag < 0.15f || timedOut) {          // within ~9 degrees
                 if (timedOut) {
-                    DEBUG_PRINT("CAVEBAT: turnaround stalled, landing\n");
-                    tele_endwhy = 4;
-                    tele_phase = PHASE_LANDING;
+                    // Could not get round. Still going home, just the other way.
+                    DEBUG_PRINT("CAVEBAT: turnaround stalled, breadcrumbs home\n");
+                    force_breadcrumbs = true;
+                    brake_v0 = 0.0f;
+                    brake_start = xTaskGetTickCount();
+                    tele_phase = PHASE_BRAKE;
                 } else {
                     // The wall that was on the left is now on the right.
                     active_follow = (active_follow == 2) ? 1 : 2;

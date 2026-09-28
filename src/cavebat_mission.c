@@ -165,6 +165,24 @@ typedef struct __attribute__((packed)) {
   // One byte takes the sample to 15 and the download packet to 18, still
   // inside the 19 that fits a single BLE notification.
   uint8_t wf;
+
+  // The WORST tilt seen since the previous sample, in 2-degree units.
+  //
+  // A peak, not a snapshot, because samples are one second apart and a flip
+  // takes a fraction of that -- an instantaneous reading would miss it
+  // entirely. Recorded rather than printed for the same reason the state is:
+  // the console drops exactly the lines that matter, and two crashes have now
+  // gone unexplained because of it.
+  //
+  // This is the one measurement that separates the two remaining explanations.
+  // Tilt CLIMBING across several samples means the controller is fighting a
+  // position estimate it cannot trust, which is a software problem. Tilt near
+  // zero and then suddenly enormous means nothing was fighting anything and
+  // the aircraft hit something, which is not.
+  //
+  // One byte takes the sample to 16 and the packet to 19, the most that fits
+  // in a single BLE notification.
+  uint8_t tilt;
 } FlightSample;
 
 // 1Hz sampling, so 180 samples is three minutes -- well past the one minute we
@@ -423,6 +441,9 @@ static TickType_t brake_start = 0;
 // and re-aligning to the wall.
 #define WF_LOST_MS 10000
 static TickType_t last_following_tick = 0;
+
+// Worst tilt since the last sample, 2-degree units. See FlightSample.tilt.
+static uint8_t tilt_peak = 0;
 
 // The heading the RETURN leg is holding, in radians. Bookkeeping for
 // issueStep, which needs to know the heading it last commanded so it can work
@@ -1045,6 +1066,13 @@ void appMain(void) {
       float pitch_now = safeLogFloat(idPitch);
       if (roll_now < 0) roll_now = -roll_now;
       if (pitch_now < 0) pitch_now = -pitch_now;
+      // Worst tilt this second, held until the next sample takes it.
+      {
+        float worst = (roll_now > pitch_now) ? roll_now : pitch_now;
+        uint16_t units = (uint16_t)(worst / 2.0f);
+        if (units > 255) units = 255;
+        if ((uint8_t)units > tilt_peak) tilt_peak = (uint8_t)units;
+      }
       // 5Hz, not the full 10.
       //
       // The console shares a 20-byte BLE link with two 5Hz log blocks and a
@@ -1094,6 +1122,8 @@ void appMain(void) {
         // The follower's state and the flight mode, one nibble each.
         fs->wf    = (uint8_t)((mission_wallfollow & 0x0f) << 4)
                   | (uint8_t)(tele_wfstate & 0x0f);
+        fs->tilt  = tilt_peak;
+        tilt_peak = 0;   // each sample owns the second before it
         sample_count++;
         tele_samples = sample_count;
       }

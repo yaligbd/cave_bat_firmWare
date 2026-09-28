@@ -143,6 +143,28 @@ typedef struct __attribute__((packed)) {
   // inside the 19 that fits one BLE notification.
   int16_t yaw;
   uint8_t front, back, left, right, up, down;   // ranges, 2cm units, 0 = none
+
+  // What the wall follower was doing, packed into one byte:
+  //   low  4 bits  the follower's state (0 forward .. 7 findCorner)
+  //   high 4 bits  the flight mode (0 hover, 1 wall right, 2 wall left)
+  //
+  // WHY THIS IS RECORDED RATHER THAN PRINTED. The state was going out on the
+  // console, and the console does not survive. A wall-following flight came
+  // back missing "Initiating Takeoff", missing "following wall on the LEFT"
+  // and missing every line of the trace, with the drone reporting "LOG packets
+  // drop detected" -- the crash it was meant to explain left no evidence at
+  // all. The console shares a 20-byte BLE link with three log blocks and loses
+  // whatever does not fit.
+  //
+  // The recording does not have that problem: it is written to memory during
+  // the flight and downloaded afterwards over a quiet link, and every sample
+  // of every flight so far has arrived intact. The samples already carry the
+  // position, the heading and all six ranges -- the decision made from them
+  // was the only thing missing.
+  //
+  // One byte takes the sample to 15 and the download packet to 18, still
+  // inside the 19 that fits a single BLE notification.
+  uint8_t wf;
 } FlightSample;
 
 // 1Hz sampling, so 180 samples is three minutes -- well past the one minute we
@@ -932,6 +954,9 @@ void appMain(void) {
         fs->right = rangeTo2cm(tele_right);
         fs->up    = rangeTo2cm(tele_up);
         fs->down  = rangeTo2cm(tele_down);
+        // The follower's state and the flight mode, one nibble each.
+        fs->wf    = (uint8_t)((mission_wallfollow & 0x0f) << 4)
+                  | (uint8_t)(tele_wfstate & 0x0f);
         sample_count++;
         tele_samples = sample_count;
       }

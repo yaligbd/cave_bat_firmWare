@@ -243,8 +243,6 @@ static uint8_t mission_wallfollow = 0;
 // back" means.
 static uint8_t active_follow = 0;
 
-// Heading to reach before the turnaround is complete, radians.
-static float turn_target = 0.0f;
 
 // Set when following the wall home has failed, so the braking phase falls back
 // to the breadcrumb trail instead of trying to turn round again.
@@ -637,7 +635,6 @@ static uint16_t waypoint_count = 0;
 // by. But a wall-following flight uses these instead: it turns 180 degrees on
 // the spot and follows the same wall back, never leaving velocity control and
 // never trusting a position estimate it has not checked against anything.
-#define PHASE_TURNAROUND 6
 #define PHASE_HOMEBOUND  7
 
 // How close to the takeoff point counts as home, mm.
@@ -648,11 +645,18 @@ static uint16_t waypoint_count = 0;
 // circling is not.
 #define HOME_RADIUS_MM  500
 
-// Give up turning round after this long and land where it is. A 180 at
-// 25 deg/s takes about seven seconds, so this only fires if the turn is not
-// progressing at all.
-#define TURNAROUND_MS  12000
-static TickType_t turnaround_start = 0;
+// How close to a breadcrumb counts as reaching it, mm. Crumbs are 150mm apart,
+// so this chains through them smoothly instead of stopping at each one.
+#define RETRACE_ARRIVE_MM 250
+
+// The most the wall may push the aircraft sideways on the way home, m/s.
+//
+// Deliberately a fifth of the travel speed. The trail knows the ROUTE; the wall
+// only knows how far sideways the aircraft has drifted off it. Letting the trim
+// approach the travel speed would let one bad range reading steer the aircraft
+// rather than nudge it.
+#define WALL_TRIM_MS    0.04f
+
 
 // How long to spend slowing down. Long enough that the aircraft never has to
 // pitch hard to lose 0.2 m/s.
@@ -1088,6 +1092,48 @@ static float wallCorrection(int16_t recordedSide) {
   // metres along body y.
   float sign = (active_follow == 2) ? 1.0f : -1.0f;
   return sign * err / 1000.0f;
+}
+
+// How hard the wall says to push sideways, m/s along body y.
+//
+// The position version of this (wallCorrection) shifts a goTo target. The way
+// home is flown on velocity now, so the same idea has to arrive as a speed.
+// Same guards: nothing unless both readings are real, nothing for noise under
+// 50mm, and never more than WALL_TRIM_MS however large the error.
+static float wallVelocity(int16_t recordedSide) {
+  if (!active_follow || recordedSide <= 0) return 0.0f;
+
+  float live = (active_follow == 2) ? safeLogFloat(wf_idLeft)
+                                    : safeLogFloat(wf_idRight);
+  if (live <= 0.0f || live >= 3000.0f) return 0.0f;
+
+  float err = live - (float)recordedSide;       // +ve = further out than before
+  float mag = err < 0.0f ? -err : err;
+  if (mag < (float)WF_FIX_MIN_MM) return 0.0f;
+
+  // Proportional, then capped. Body +y is LEFT, so following on the left means
+  // closing the gap is +y and on the right it is -y.
+  float v = (err / 1000.0f) * 0.5f;
+  if (v >  WALL_TRIM_MS) v =  WALL_TRIM_MS;
+  if (v < -WALL_TRIM_MS) v = -WALL_TRIM_MS;
+  return (active_follow == 2) ? v : -v;
+}
+
+// Hand the outbound leg to the reverse retrace.
+//
+// Stays under velocity control the whole way -- there is no handover to the
+// trajectory planner any more, which is where every sag in this project
+// happened.
+static void releaseVelocityHome(void) {
+  // Rejoin the trail where the aircraft actually is.
+  return_index = nearestWaypoint();
+  home_travel_mm = 0;
+  travel_last_x = tele_x;
+  travel_last_y = tele_y;
+  vx_cmd = 0.0f;
+  vy_cmd = 0.0f;
+  step_active = false;
+  tele_phase = PHASE_HOMEBOUND;
 }
 
 // Is the way to the next return target clear?
@@ -1542,7 +1588,6 @@ void appMain(void) {
         home_travel_mm = 0;
         travel_last_x = 0;
         travel_last_y = 0;
-        turn_target = 0.0f;
         vy_cmd = 0.0f;
         brake_v0 = 0.0f;
         home_turn_done = false;
@@ -1622,12 +1667,10 @@ void appMain(void) {
                     // come out of the return leg alone, so the aircraft ran
                     // out of time before it got back and landed well short.
                     // Taking it off the top gives both legs the same budget.
-                    {
-                      uint32_t total = mission_timer * 1000;
-                      uint32_t usable = (total > TURNAROUND_MS + 4000)
-                                          ? (total - TURNAROUND_MS) : (total / 2);
-                      outbound_deadline = xTaskGetTickCount() + M2T(usable / 2);
-                    }
+                    // Half out, half back. Nothing is spent turning round any
+                    // more, so the two legs cost the same and split evenly.
+                    outbound_deadline = xTaskGetTickCount()
+                                      + M2T((mission_timer * 1000) / 2);
                     // Where we started, so the trail always ends at the pad.
                     dropBreadcrumb();
                     // Starts now, not at takeoff: the climb is not searching.
@@ -1827,79 +1870,106 @@ void appMain(void) {
                 // exactly this: it tells the planner the live state estimate
                 // and drops the priority in one go, so the next goTo plans
                 // from where the aircraft actually is.
-                if (active_follow && !force_breadcrumbs) {
-                    // TURN ROUND AND FOLLOW THE WALL BACK.
-                    //
-                    // No handover at all: the aircraft stays under velocity
-                    // control, so the sag that happened at every single
-                    // handover cannot happen here.
-                    turn_target = wrapYaw(safeLogFloat(wf_idYaw) * DEG2RAD + 3.14159265f);
-                    turnaround_start = xTaskGetTickCount();
-                    tele_phase = PHASE_TURNAROUND;
-                    DEBUG_PRINT("CAVEBAT: turning round to follow the wall home\n");
-                } else {
-                    // No wall to follow home -- a hover mission, or wall
-                    // following was never on. Breadcrumbs are all there is.
-                    releaseToHighLevel();
-                    step_active = false;
-                    // Rejoin the trail where the aircraft actually is, then
-                    // walk it back to the pad. +1 because the step below
-                    // decrements before using it.
-                    return_index = (uint16_t)(nearestWaypoint() + 1);
-                    if (return_index > waypoint_count) return_index = waypoint_count;
-                    tele_phase = PHASE_RETURN;
-                    DEBUG_PRINT("CAVEBAT: stopped, home over %d pts\n",
-                                (int)waypoint_count);
-                }
+                // FLY HOME BACKWARDS ALONG THE TRAIL.
+                //
+                // No 180 and no handover. The turn used to cost nine seconds
+                // of a sixteen-second flight and was pure rotation, which is
+                // the one thing the Flow deck handles worst -- so it spent the
+                // time AND damaged the position estimate it needed afterwards.
+                //
+                // Flying the recorded path in reverse with the heading held
+                // gives the same route for none of that. The wall stays on the
+                // side it was already on, so the side ranger still sees it and
+                // can still correct sideways drift.
+                releaseVelocityHome();
+                DEBUG_PRINT("CAVEBAT: home backwards over %d pts\n",
+                            (int)waypoint_count);
             }
 
-        } else if (tele_phase == PHASE_TURNAROUND) {
-            // --- Turning round on the spot ------------------------------
+        } else if (tele_phase == PHASE_HOMEBOUND) {
+            // --- Retracing the trail in reverse -------------------------
             //
-            // Zero translation, pure rotation, until the heading has come
-            // round by 180 degrees. Rotating in place is the one manoeuvre
-            // the Flow deck copes with worst, so it is done at the capped
-            // rate and with nothing else going on at the same time.
-            float now = wrapYaw(safeLogFloat(wf_idYaw) * DEG2RAD);
-            float err = wrapYaw(turn_target - now);
-            float mag = err < 0.0f ? -err : err;
+            // Two sources, because neither is enough alone.
+            //
+            // The breadcrumbs give the SHAPE of the way back -- they are the
+            // only record of where the aircraft actually went, corners and
+            // all. But they are Flow deck positions, and those drift.
+            //
+            // The wall gives ACCURACY, but only across its own direction: it
+            // says how far sideways the aircraft is from where it was, and
+            // nothing at all about how far along it has come.
+            //
+            // So the trail steers and the wall trims. Heading is held
+            // throughout, so the aircraft flies backwards or sideways -- which
+            // it does perfectly well, and which keeps the wall on the side the
+            // ranger is already pointing at.
+            int64_t hx = tele_x, hy = tele_y;
+            bool posSaysHome =
+                (hx * hx + hy * hy) <= (int64_t)HOME_RADIUS_MM * (int64_t)HOME_RADIUS_MM;
+            bool travelSaysHome =
+                outbound_travel_mm > 0 && home_travel_mm >= outbound_travel_mm;
 
-            bool timedOut = (int32_t)(xTaskGetTickCount() - turnaround_start)
-                              >= (int32_t)M2T(TURNAROUND_MS);
-
-            if (mag < 0.15f || timedOut) {          // within ~9 degrees
-                if (timedOut) {
-                    // Could not get round. Still going home, just the other way.
-                    DEBUG_PRINT("CAVEBAT: turnaround stalled, breadcrumbs home\n");
-                    force_breadcrumbs = true;
-                    brake_v0 = 0.0f;
-                    brake_start = xTaskGetTickCount();
-                    tele_phase = PHASE_BRAKE;
-                } else {
-                    // The wall that was on the left is now on the right.
-                    active_follow = (active_follow == 2) ? 1 : 2;
-                    wallFollowerInit(mission_walldist / 1000.0f, WF_SPEED_MS,
-                                     forwardAlongWall);
-                    wf_state = forwardAlongWall;
-                    last_following_tick = xTaskGetTickCount();
-                    vx_cmd = 0.0f;
-                    vy_cmd = 0.0f;
-                    // The return's odometry starts here, from where the turn
-                    // finished, so the pivot itself is not counted as travel.
-                    home_travel_mm = 0;
-                    travel_last_x = tele_x;
-                    travel_last_y = tele_y;
-                    tele_phase = PHASE_HOMEBOUND;
-                    DEBUG_PRINT("CAVEBAT: round, following wall on the %s home\n",
-                                active_follow == 2 ? "LEFT" : "RIGHT");
-                }
+            if (waypoint_count == 0 || posSaysHome || travelSaysHome) {
+                tele_outwhy = 6;
+                DEBUG_PRINT("CAVEBAT: home (%s) at %d,%d mm, out %d back %d\n",
+                            posSaysHome ? "position" : "distance",
+                            (int)tele_x, (int)tele_y,
+                            (int)outbound_travel_mm, (int)home_travel_mm);
+                tele_phase = PHASE_LANDING;
             } else {
-                // Rotate toward the target, at the capped rate.
-                float rate = (err > 0.0f) ? WF_MAX_YAWRATE_DEG : -WF_MAX_YAWRATE_DEG;
-                vel_active = true;
-                vx_cmd = 0.0f;
-                vy_cmd = 0.0f;
-                sendBodyVelocity(0.0f, 0.0f, commandedHeight(), rate);
+                float tx = waypoints[return_index].x / 1000.0f;
+                float ty = waypoints[return_index].y / 1000.0f;
+                float dx = tx - (tele_x / 1000.0f);
+                float dy = ty - (tele_y / 1000.0f);
+                float dist = sqrtf(dx * dx + dy * dy);
+
+                if (dist < (float)RETRACE_ARRIVE_MM / 1000.0f) {
+                    // Reached this crumb; aim at the previous one.
+                    if (return_index == 0) {
+                        tele_outwhy = 6;
+                        DEBUG_PRINT("CAVEBAT: trail end at %d,%d mm, landing\n",
+                                    (int)tele_x, (int)tele_y);
+                        tele_phase = PHASE_LANDING;
+                    } else {
+                        return_index--;
+                    }
+                } else {
+                    // Straight at the crumb, expressed in the body frame the
+                    // motors think in. Heading is held, so this comes out as
+                    // backwards and sideways rather than as a turn.
+                    float ux = dx / dist, uy = dy / dist;
+                    float c = cosf(meas_yaw), sn = sinf(meas_yaw);
+                    float vx =  (ux * c + uy * sn) * WF_SPEED_MS;
+                    float vy = (-ux * sn + uy * c) * WF_SPEED_MS;
+
+                    // The wall trims it sideways. Small next to the travel
+                    // speed, because the trail is what knows the route -- this
+                    // only corrects drift across it.
+                    vy += wallVelocity(waypoints[return_index].side);
+
+                    vel_active = true;
+                    clampAwayFromObstacles(&vx, &vy);
+
+                    float maxStep = WF_ACCEL_MS2 * 0.1f;
+                    float dvx = vx - vx_cmd, dvy = vy - vy_cmd;
+                    if (dvx >  maxStep) dvx =  maxStep;
+                    if (dvx < -maxStep) dvx = -maxStep;
+                    if (dvy >  maxStep) dvy =  maxStep;
+                    if (dvy < -maxStep) dvy = -maxStep;
+                    vx_cmd += dvx;
+                    vy_cmd += dvy;
+
+                    // Yaw rate zero: the heading held on the way out is the
+                    // heading flown on the way back.
+                    sendBodyVelocity(vx_cmd, vy_cmd, commandedHeight(), 0.0f);
+                    accumulateTravel(&home_travel_mm);
+
+                    if ((tele_alive % 10) == 0) {
+                        DEBUG_PRINT("RTN pt%d %dmm s=%d\n",
+                                    (int)return_index, (int)(dist * 1000.0f),
+                                    (int)(active_follow == 2 ? tele_left : tele_right));
+                    }
+                }
             }
 
         } else if (tele_phase == PHASE_RETURN) {

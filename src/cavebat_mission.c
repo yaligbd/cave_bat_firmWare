@@ -20,7 +20,7 @@
 #include "crtp_commander_high_level.h"
 #include "stabilizer_types.h"
 #include "crtp.h"
-#include "wallfollowing_multiranger_onboard.h"
+#include "wallfollowing_tudelft.h"
 #include <string.h>
 #include <math.h>
 
@@ -286,7 +286,7 @@ static setpoint_t wf_setpoint;
 
 // Which state the follower is in, published so a crash log says what the
 // aircraft was doing rather than leaving us to guess again.
-static StateWF wf_state = forward;
+static int wf_state = TUD_FORWARD;
 static uint8_t tele_wfstate = 0;
 
 // The sensors the follower reads. File scope because it runs outside the
@@ -594,15 +594,36 @@ static void wfTick(void) {
   float now_s = (float)xTaskGetTickCount() / (float)configTICK_RATE_HZ;
 
   float vx = 0.0f, vy = 0.0f, yawRateRad = 0.0f;
-  wf_state = wallFollower(&vx, &vy, &yawRateRad,
-                          frontRange, sideRange, yawRad, direction, now_s);
+  wf_state = wallFollowerTudelft(&vx, &vy, &yawRateRad,
+                                 frontRange, sideRange, yawRad, direction, now_s);
   tele_wfstate = (uint8_t)wf_state;
 
-  // Cap the rotation. See WF_MAX_YAWRATE_DEG for why turning slowly matters
-  // more here than turning quickly.
+  // Cap the rotation -- and slow the TRANSLATION by the same factor.
+  //
+  // See WF_MAX_YAWRATE_DEG for why turning slowly matters here. But capping the
+  // turn ALONE is wrong, because around an outside corner the follower does not
+  // choose a turn rate independently: it derives one from the forward speed in
+  // order to fly a particular arc.
+  //
+  //     vel_w = direction * (-vel_x / radius)
+  //
+  // The radius is the wall distance, so the aircraft curves around the corner
+  // at the range it was already holding. Capping the yaw rate and leaving the
+  // speed alone changes that radius -- 0.2 m/s against a 20 deg/s cap arcs at
+  // 0.57m instead of the 0.4m intended, so it runs wide and stops tracking the
+  // wall it is turning around. Scaling both keeps the ratio, and therefore the
+  // arc, exactly as written. The corner is flown on the same path, just slower.
+  //
+  // States that rotate on the spot have vel_x = 0 already, so this costs them
+  // nothing at all.
   float yawRateDeg = yawRateRad * RAD2DEG;
-  if (yawRateDeg >  WF_MAX_YAWRATE_DEG) yawRateDeg =  WF_MAX_YAWRATE_DEG;
-  if (yawRateDeg < -WF_MAX_YAWRATE_DEG) yawRateDeg = -WF_MAX_YAWRATE_DEG;
+  float yawMag = yawRateDeg < 0.0f ? -yawRateDeg : yawRateDeg;
+  if (yawMag > WF_MAX_YAWRATE_DEG) {
+    float scale = WF_MAX_YAWRATE_DEG / yawMag;
+    yawRateDeg *= scale;
+    vx *= scale;
+    vy *= scale;
+  }
 
   // Last word before the setpoint goes out: never fly into anything.
   clampAwayFromObstacles(&vx, &vy);
@@ -962,7 +983,7 @@ void appMain(void) {
         // so a second flight on a warm drone would otherwise begin halfway
         // through the previous one's corner.
         vel_active = false;
-        wf_state = forward;
+        wf_state = TUD_FORWARD;
         tele_wfstate = 0;
         crumb_x = 0;
         crumb_y = 0;
@@ -986,9 +1007,9 @@ void appMain(void) {
           // out to be further than 70cm the machine drops into findCorner and
           // searches for it, so a sloppy placement degrades into a search
           // rather than a crash.
-          wallFollowerInit(mission_walldist / 1000.0f, WF_SPEED_MS,
-                           forwardAlongWall);
-          wf_state = forwardAlongWall;
+          wallFollowerTudelftInit(mission_walldist / 1000.0f, WF_SPEED_MS,
+                                  TUD_FORWARD_ALONG_WALL);
+          wf_state = TUD_FORWARD_ALONG_WALL;
         }
         climb_done_tick = xTaskGetTickCount()
                         + M2T((uint32_t)(takeoff_duration * 1000.0f));

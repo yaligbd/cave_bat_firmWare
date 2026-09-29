@@ -18,10 +18,24 @@
 # obj-y += cavebat_record.o
 obj-y += cavebat_mission.o
 obj-y += cavebat_multiranger.o
-# Bitcraze's wall-following state machine (McGuire et al., Science Robotics
-# 2019). NOT an appMain -- cavebat_mission.c calls into it. Required by the
-# mission build, not optional.
-obj-y += wallfollowing_multiranger_onboard.o
+# The wall-following state machine. NOT an appMain -- cavebat_mission.c calls
+# into it. Required by the mission build, not optional.
+#
+# TWO implementations of the same algorithm sit in this tree. Build exactly one.
+#
+#   wallfollowing_tudelft.o              TU Delft's SGBA_CF2_App_layer code: the
+#                                        implementation that flew the Science
+#                                        Robotics 2019 office-building
+#                                        experiments and came home. CURRENT.
+#   wallfollowing_multiranger_onboard.o  Bitcraze's app-layer demo version.
+#                                        Flown here for weeks. Corners fail
+#                                        roughly half the time, and its own
+#                                        unmodified Python twin crashed at the
+#                                        first corner on this aircraft.
+#
+# See the header of wallfollowing_tudelft.c for the three places they differ.
+obj-y += wallfollowing_tudelft.o
+# obj-y += wallfollowing_multiranger_onboard.o
 # obj-y += cavebat_wall.o
 # obj-y += cavebat.o
 # obj-y += cavebat_i2cscan.o

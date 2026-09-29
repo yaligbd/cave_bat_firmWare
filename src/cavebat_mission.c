@@ -1686,11 +1686,7 @@ void appMain(void) {
                 }
             }
 
-        } else if (tele_phase == PHASE_OUTBOUND || tele_phase == PHASE_HOMEBOUND) {
-            // Both legs fly the same follower. Only the reasons to stop differ,
-            // which is the whole point of turning round rather than switching
-            // to a different way of navigating.
-            bool homebound = (tele_phase == PHASE_HOMEBOUND);
+        } else if (tele_phase == PHASE_OUTBOUND) {
             if (!mission_wallfollow) {
                 // Plain hover. The high-level commander holds position on its
                 // own once the takeoff trajectory finishes.
@@ -1724,33 +1720,14 @@ void appMain(void) {
                 // estimate is the least trustworthy thing on the aircraft, and
                 // demanding precision would leave it hunting for a spot it
                 // cannot find. Landing slightly off beats circling.
-                int64_t hx = tele_x, hy = tele_y;
-                bool posSaysHome =
-                    (hx * hx + hy * hy) <= (int64_t)HOME_RADIUS_MM * (int64_t)HOME_RADIUS_MM;
-                // Come back as far as it went out. Independent of where it
-                // thinks it is, which after a 180 is the least reliable number
-                // on the aircraft.
-                bool travelSaysHome =
-                    outbound_travel_mm > 0 && home_travel_mm >= outbound_travel_mm;
-                if (homebound && (posSaysHome || travelSaysHome)) {
-                    tele_outwhy = 6;
-                    DEBUG_PRINT("CAVEBAT: home (%s) at %d,%d mm, out %d back %d\n",
-                                posSaysHome ? "position" : "distance",
-                                (int)tele_x, (int)tele_y,
-                                (int)outbound_travel_mm, (int)home_travel_mm);
-                    tele_phase = PHASE_LANDING;
-                } else if ((int32_t)(xTaskGetTickCount() - last_following_tick)
+                if ((int32_t)(xTaskGetTickCount() - last_following_tick)
                       >= (int32_t)M2T(WF_LOST_MS)) {
                     // Lost the wall. On the way out that means turn round; on
                     // the way home there is nothing left to turn round FOR, so
                     // it lands where it is rather than hunting.
                     tele_outwhy = 5;
-                    DEBUG_PRINT("CAVEBAT: lost the wall for %ds, %s\n",
-                                (int)(WF_LOST_MS / 1000),
-                                homebound ? "breadcrumbs home" : "going home");
-                    // Losing the wall on the way home does not end the
-                    // flight -- it drops to the next way of getting home.
-                    if (homebound) force_breadcrumbs = true;
+                    DEBUG_PRINT("CAVEBAT: lost the wall for %ds, going home\n",
+                                (int)(WF_LOST_MS / 1000));
                     tele_phase = PHASE_BRAKE;
                     brake_v0 = vx_cmd;
                     brake_start = xTaskGetTickCount();
@@ -1761,14 +1738,13 @@ void appMain(void) {
                     tele_phase = PHASE_BRAKE;
                     brake_start = xTaskGetTickCount();
                     brake_v0 = vx_cmd;   // ramp down from the real speed
-                } else if (!homebound && waypoint_count >= MAX_WAYPOINTS) {
+                } else if (waypoint_count >= MAX_WAYPOINTS) {
                     tele_outwhy = 4;
                     DEBUG_PRINT("CAVEBAT: breadcrumb trail full, returning\n");
                     tele_phase = PHASE_BRAKE;
                     brake_start = xTaskGetTickCount();
                     brake_v0 = vx_cmd;   // ramp down from the real speed
-                } else if (!homebound
-                           && (int32_t)(xTaskGetTickCount() - outbound_deadline) >= 0) {
+                } else if ((int32_t)(xTaskGetTickCount() - outbound_deadline) >= 0) {
                     tele_outwhy = 1;
                     DEBUG_PRINT("CAVEBAT: half timer, returning over %d points\n",
                                 (int)waypoint_count);
@@ -1781,7 +1757,7 @@ void appMain(void) {
                     // foot of the loop keeps that setpoint alive at 100Hz.
                     vel_active = true;
                     wfTick();
-                    accumulateTravel(homebound ? &home_travel_mm : &outbound_travel_mm);
+                    accumulateTravel(&outbound_travel_mm);
 
                     // Mark the trail by distance travelled. The return leg
                     // retraces these, so they have to be close enough together

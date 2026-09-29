@@ -515,7 +515,23 @@ static TickType_t brake_start = 0;
 // 10s is comfortably longer than a real corner, which needs about 5 to 6: a 46
 // degree rotation at 25 deg/s, a one second measurement pause, then finding
 // and re-aligning to the wall.
-#define WF_LOST_MS 10000
+// 6 seconds, down from 10.
+//
+// 10 was a guess. This is measured: in the flight that set it, the corner that
+// WORKED took three seconds -- rotateInCorner, two ticks of turnToAlignToWall,
+// then back to following. The corner that failed thrashed for ten and drifted
+// nearly 400mm doing it, yaw swinging between -75 and -150 degrees, until it
+// ran out of room.
+//
+// So ten seconds was not a safety net, it was ten seconds of an aircraft
+// wandering around a corner it had already failed. Six is double what a
+// working corner needs and little more than half the exposure.
+//
+// The cost is real and worth stating: a genuinely slow corner -- an outward
+// one, where findCorner has to search and turnToAlignToWall waits a full
+// second for measurements before it even turns -- may now be abandoned when it
+// would have succeeded. Coming home early beats not coming home.
+#define WF_LOST_MS 6000
 static TickType_t last_following_tick = 0;
 
 // How many consecutive ticks in forwardAlongWall count as genuinely following.

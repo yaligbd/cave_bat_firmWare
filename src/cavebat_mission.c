@@ -520,6 +520,12 @@ static TickType_t brake_start = 0;
 #define WF_LOST_MS 10000
 static TickType_t last_following_tick = 0;
 
+// How many consecutive ticks in forwardAlongWall count as genuinely following.
+// 5 ticks is half a second. See where it is used for why a single tick is not
+// enough.
+#define FOLLOW_CONFIRM_TICKS 5
+static uint8_t following_streak = 0;
+
 // --- Stop flying the mission when the aircraft starts losing it -------------
 //
 // Tilt past this many degrees, for two ticks running, ends the flight: the
@@ -971,7 +977,24 @@ static void wfTick(void) {
 
   // The one state meaning "a wall is beside me and I am following it".
   // Everything else is searching for one, and searching has a time limit.
-  if (wf_state == forwardAlongWall) last_following_tick = xTaskGetTickCount();
+  //
+  // SUSTAINED following, not a touch. This is the bug that let an eleven-second
+  // corner oscillation run to a crash with the ten-second give-up never firing.
+  //
+  // The machine bounces: turnToAlignToWall passes its heading check, enters
+  // forwardAlongWall, which immediately sees the wall too far or something
+  // ahead and bounces straight back out. That single tick used to reset the
+  // clock, so a follower thrashing THROUGH forwardAlongWall never looked lost,
+  // however long it thrashed. Half a second of it is the difference between
+  // actually following a wall and glancing off the state on the way past.
+  if (wf_state == forwardAlongWall) {
+    if (following_streak < 255) following_streak++;
+    if (following_streak >= FOLLOW_CONFIRM_TICKS) {
+      last_following_tick = xTaskGetTickCount();
+    }
+  } else {
+    following_streak = 0;
+  }
 
   // Cap the rotation -- and slow the TRANSLATION by the same factor.
   //

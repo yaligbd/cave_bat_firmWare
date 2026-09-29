@@ -410,7 +410,7 @@ static setpoint_t wf_setpoint;
 
 // Which state the follower is in, published so a crash log says what the
 // aircraft was doing rather than leaving us to guess again.
-static StateWF wf_state = forward;
+// The follower's state lives with the follower now; see StateSF.
 static uint8_t tele_wfstate = 0;
 
 // The sensors the follower reads. File scope because it runs outside the
@@ -534,7 +534,7 @@ static TickType_t brake_start = 0;
 #define WF_LOST_MS 6000
 static TickType_t last_following_tick = 0;
 
-// How many consecutive ticks in forwardAlongWall count as genuinely following.
+// How many consecutive ticks in SF_FOLLOW count as genuinely following.
 // 5 ticks is half a second. See where it is used for why a single tick is not
 // enough.
 #define FOLLOW_CONFIRM_TICKS 5
@@ -979,35 +979,270 @@ static float commandedHeight(void) {
   return h;
 }
 
+// --- A corner is a sequence, not a cloud of states ---------------------------
+//
+// WHAT THIS REPLACES, AND WHY.
+//
+// Bitcraze's follower flies a corner as a continuous blend: four states
+// (rotateInCorner, rotateAroundWall, turnToAlignToWall, findCorner) that each
+// read the sensors, command a curve, and hand off to one another whenever a
+// threshold happens to be crossed. On an ideal corner it is elegant. On a real
+// one it oscillates -- and every crash this project has recorded happened
+// inside those four states. Not one happened in straight following.
+//
+// A measured example, from the recording that prompted this. One flight rounded
+// its first corner in three seconds, then spent ten on the second:
+// rotateInCorner, rotateAroundWall, turnToAlignToWall, rotateInCorner,
+// findCorner, drifting 400mm while it cycled, until it ran out of room and hit
+// something. Tilt stayed under 6 degrees and height held within 60mm the whole
+// time. The aircraft was flying perfectly. It simply never decided anything.
+//
+// So a corner stops being a feedback problem and becomes a script:
+//
+//   wall ahead    -> stop, turn 90 degrees away from it, check, carry on
+//   wall vanished -> drive out past the corner, turn 90 degrees into it,
+//                    creep until the wall is back, carry on
+//
+// Three properties the blend did not have:
+//
+//   Each step ENDS. A turn finishes when the heading is reached, not when some
+//   distance threshold happens to agree. No step can hand back to the step it
+//   came from, so the machine cannot cycle. That alone removes the failure.
+//
+//   Turns happen STOPPED. Rotation is what ruins optical flow, and rotating
+//   while translating ruins it most, because the Flow deck cannot separate the
+//   two. Turning on the spot costs about two seconds and buys a position
+//   estimate that survives the corner -- which the whole return leg depends on.
+//
+//   The turn is VERIFIED. Afterwards the wall must actually be beside it and the
+//   way ahead must actually be clear. If not, this was not the corner it thought
+//   it was, and it acts on that instead of flying on in hope.
+typedef enum {
+  SF_FOLLOW = 0,   // wall beside me, flying along it
+  SF_STOP   = 1,   // wall ahead: stopping before turning
+  SF_TURN   = 2,   // turning 90 degrees on the spot
+  SF_VERIFY = 3,   // did that turn actually work?
+  SF_PAST   = 4,   // wall ended: driving out past the corner
+  SF_REACQ  = 5,   // creeping forward until the wall comes back
+} StateSF;
+
+#define SF_FRONT_STOP_MM   400   // wall this close ahead is an inward corner
+#define SF_FRONT_CLEAR_MM  600   // ahead only counts as clear past this
+#define SF_SIDE_GONE_MM    900   // side reading past this: the wall ended
+#define SF_SIDE_FOUND_MM   700   // side reading inside this: wall re-acquired
+#define SF_TURN_RATE_DEG    40.0f
+#define SF_TURN_TOL_DEG      8.0f
+#define SF_ALIGN_MAX_DEG    12.0f // ceiling on the stay-parallel nudge
+#define SF_ALIGN_GAIN        0.04f
+#define SF_PAST_MM         350   // travel past an outward corner before turning
+#define SF_CREEP_MS          0.10f
+#define SF_STOPPED_MS        0.06f
+#define SF_VERIFY_MS       600   // let the rangers settle after a rotation
+#define SF_MAX_TURNS         4   // turns without following = going in circles
+#define SF_QUARTER_RAD       1.5707963f
+
+static StateSF    sf_state     = SF_FOLLOW;
+static float      sf_goal_yaw  = 0.0f; // absolute heading a turn is aiming at
+static TickType_t sf_entered   = 0;    // when the current step began
+static int32_t    sf_past_mm   = 0;    // travelled since the wall ended
+static float      sf_last_side = 0.0f; // previous side reading, for alignment
+static uint8_t    sf_turns     = 0;    // turns since it last really followed
+
+// Shortest way round. Without this a turn across the +/-180 seam reads as a
+// 350 degree error and the aircraft spins the long way round to gain 10.
+static float angDiff(float target, float now) {
+  float d = target - now;
+  while (d >  3.14159265f) d -= 6.28318531f;
+  while (d < -3.14159265f) d += 6.28318531f;
+  return d;
+}
+
+static void sfEnter(StateSF s) {
+  sf_state = s;
+  sf_entered = xTaskGetTickCount();
+  // Entering a new step IS progress. The give-up timer exists to catch a
+  // machine that is stuck, and a bounded script that keeps advancing is not
+  // stuck -- so it only has to survive ONE step, not a whole corner.
+  last_following_tick = xTaskGetTickCount();
+}
+
+static void sfReset(void) {
+  sf_state = SF_FOLLOW;
+  sf_entered = xTaskGetTickCount();
+  sf_goal_yaw = 0.0f;
+  sf_past_mm = 0;
+  sf_last_side = 0.0f;
+  sf_turns = 0;
+}
+
+static void sfTick(float *vx, float *vy, float *yawDeg) {
+  float front = safeLogFloat(wf_idFront);
+  float side  = (active_follow == 2) ? safeLogFloat(wf_idLeft)
+                                     : safeLogFloat(wf_idRight);
+  float wall  = (float)mission_walldist;
+
+  // Following on the LEFT, an inward corner turns RIGHT -- negative, because
+  // yaw counts anticlockwise -- and an outward corner turns left. Following on
+  // the right, both flip. One sign carries that everywhere below.
+  float inSign = (active_follow == 2) ? -1.0f : 1.0f;
+
+  *vx = 0.0f; *vy = 0.0f; *yawDeg = 0.0f;
+
+  // A zero reading means the laser saw nothing, which at these ranges means
+  // far away, not touching. Everything below reads zero as open space.
+  bool frontBlocked = front > 0.0f && front < (float)SF_FRONT_STOP_MM;
+  bool frontClear   = front <= 0.0f || front > (float)SF_FRONT_CLEAR_MM;
+  bool sideGone     = side  <= 0.0f || side  > (float)SF_SIDE_GONE_MM;
+  bool sideFound    = side  >  0.0f && side  < (float)SF_SIDE_FOUND_MM;
+
+  switch (sf_state) {
+
+  case SF_FOLLOW: {
+    if (frontBlocked) { sfEnter(SF_STOP); break; }
+    if (sideGone)     { sf_past_mm = 0; sfEnter(SF_PAST); break; }
+
+    // Hold the asked-for distance by strafing. Positive error means too far
+    // off the wall, so move toward it -- +y in the body frame when the wall is
+    // on the left, -y when it is on the right.
+    float err_m = (side - wall) / 1000.0f;
+    float trim  = err_m * 0.6f;
+    float lim   = WF_SPEED_MS * 0.5f;
+    if (trim >  lim) trim =  lim;
+    if (trim < -lim) trim = -lim;
+
+    // Stay PARALLEL, using the only evidence there is: one ranger and time.
+    // Flying forward beside a wall, a side reading that grows means the nose is
+    // pointing away from it. Nudging back is what stops a long wall turning
+    // into a slow diagonal that the strafe above then fights the whole way.
+    // Deliberately weak and capped: rotation costs position, and a few degrees
+    // off parallel costs nothing.
+    float align = 0.0f;
+    if (sf_last_side > 0.0f && side > 0.0f) {
+      align = (side - sf_last_side) * SF_ALIGN_GAIN;
+      if (align >  SF_ALIGN_MAX_DEG) align =  SF_ALIGN_MAX_DEG;
+      if (align < -SF_ALIGN_MAX_DEG) align = -SF_ALIGN_MAX_DEG;
+    }
+
+    *vx = WF_SPEED_MS;
+    *vy     = (active_follow == 2) ?  trim  : -trim;
+    *yawDeg = (active_follow == 2) ?  align : -align;
+    break;
+  }
+
+  case SF_STOP:
+    // The velocities are already zero, so this step simply commands a halt and
+    // waits for it. The slew limiter in wfTick turns that into a deceleration
+    // rather than a step change, which is what keeps the nose from dipping --
+    // the dip that used to end these flights.
+    if (vx_cmd < SF_STOPPED_MS && vx_cmd > -SF_STOPPED_MS &&
+        vy_cmd < SF_STOPPED_MS && vy_cmd > -SF_STOPPED_MS) {
+      sf_goal_yaw = meas_yaw + inSign * SF_QUARTER_RAD;
+      sf_turns++;
+      DEBUG_PRINT("CORNER in: stopped at %dmm, turning\n", (int)front);
+      sfEnter(SF_TURN);
+    }
+    break;
+
+  case SF_TURN: {
+    float errDeg = angDiff(sf_goal_yaw, meas_yaw) * RAD2DEG;
+    if (errDeg < SF_TURN_TOL_DEG && errDeg > -SF_TURN_TOL_DEG) {
+      sfEnter(SF_VERIFY);
+      break;
+    }
+    *yawDeg = errDeg > 0.0f ? SF_TURN_RATE_DEG : -SF_TURN_RATE_DEG;
+    break;
+  }
+
+  case SF_VERIFY:
+    // Believe the rangers only after they have had a moment to settle: they are
+    // reading a different part of the room than they were a second ago.
+    if ((int32_t)(xTaskGetTickCount() - sf_entered) < (int32_t)M2T(SF_VERIFY_MS)) {
+      break;
+    }
+
+    if (frontClear && sideFound) {
+      // The wall that was ahead is now the wall beside us. Carry on.
+      DEBUG_PRINT("CORNER done: wall at %dmm, following\n", (int)side);
+      sf_turns = 0;
+      sf_last_side = 0.0f;
+      sfEnter(SF_FOLLOW);
+    } else if (!frontClear) {
+      // Still blocked ahead. This is not a corner, it is a dead end or a gap
+      // narrower than the turn. Turning again completes a second 90 degrees,
+      // which is a 180: the way back out. That is the right answer to a dead
+      // end, and it costs nothing to be wrong about.
+      sf_goal_yaw = meas_yaw + inSign * SF_QUARTER_RAD;
+      sf_turns++;
+      DEBUG_PRINT("CORNER still blocked at %dmm, turning again\n", (int)front);
+      sfEnter(SF_TURN);
+    } else {
+      // Clear ahead but nothing beside us: the turn came round short of the
+      // wall, or it is further off than expected. Go and look for it.
+      sf_past_mm = 0;
+      sfEnter(SF_REACQ);
+    }
+    break;
+
+  case SF_PAST:
+    // The wall ended. Turning here would turn into thin air and lose it, so
+    // carry straight on until the corner is behind the aircraft.
+    if (sideFound) {
+      // It came back. That was a doorway or a gap, not a corner -- which is the
+      // single most common thing in a real building, and the old machine
+      // treated every one of them as a corner to be rounded.
+      sf_last_side = 0.0f;
+      sfEnter(SF_FOLLOW);
+      break;
+    }
+    if (frontBlocked) { sfEnter(SF_STOP); break; }
+
+    *vx = WF_SPEED_MS;
+    sf_past_mm += (int32_t)(vx_cmd * 100.0f);   // m/s at 10Hz, as mm
+    if (sf_past_mm >= SF_PAST_MM) {
+      sf_goal_yaw = meas_yaw - inSign * SF_QUARTER_RAD;   // into the corner
+      sf_turns++;
+      DEBUG_PRINT("CORNER out: %dmm past, turning in\n", (int)sf_past_mm);
+      sfEnter(SF_TURN);
+    }
+    break;
+
+  case SF_REACQ:
+    // Creep, do not fly. If a wall is about to appear alongside, speed is the
+    // last thing wanted.
+    *vx = SF_CREEP_MS;
+    if (sideFound) {
+      DEBUG_PRINT("CORNER reacquired at %dmm\n", (int)side);
+      sf_turns = 0;
+      sf_last_side = 0.0f;
+      sfEnter(SF_FOLLOW);
+    } else if (frontBlocked) {
+      sfEnter(SF_STOP);
+    }
+    break;
+  }
+
+  // GOING IN CIRCLES. Four turns without once settling into following a wall
+  // means the room is not what this script assumes, and a fifth will not help.
+  // Backdating the follow clock hands it straight to the give-up check, which
+  // takes it home -- the one thing that is always worth doing.
+  if (sf_turns > SF_MAX_TURNS) {
+    DEBUG_PRINT("CORNER lost: %d turns without following\n", (int)sf_turns);
+    last_following_tick = xTaskGetTickCount() - M2T(WF_LOST_MS) - 1;
+  }
+
+  sf_last_side = side;
+  tele_wfstate = (uint8_t)sf_state;
+}
+
 static void wfTick(void) {
-  float frontRange = safeLogFloat(wf_idFront) / 1000.0f;
-  float sideRange  = (active_follow == 2 ? safeLogFloat(wf_idLeft)
-                                              : safeLogFloat(wf_idRight)) / 1000.0f;
-  float yawRad     = safeLogFloat(wf_idYaw) * DEG2RAD;
-  int   direction  = (active_follow == 2) ? -1 : 1;
+  float vx = 0.0f, vy = 0.0f, yawDeg = 0.0f;
+  sfTick(&vx, &vy, &yawDeg);
 
-  // The follower measures its own timeouts in seconds against this, so it has
-  // to keep counting up across the whole flight. Ticks since boot, as seconds.
-  float now_s = (float)xTaskGetTickCount() / (float)configTICK_RATE_HZ;
-
-  float vx = 0.0f, vy = 0.0f, yawRateRad = 0.0f;
-  wf_state = wallFollower(&vx, &vy, &yawRateRad,
-                          frontRange, sideRange, yawRad, direction, now_s);
-  tele_wfstate = (uint8_t)wf_state;
-
-  // The one state meaning "a wall is beside me and I am following it".
-  // Everything else is searching for one, and searching has a time limit.
-  //
-  // SUSTAINED following, not a touch. This is the bug that let an eleven-second
-  // corner oscillation run to a crash with the ten-second give-up never firing.
-  //
-  // The machine bounces: turnToAlignToWall passes its heading check, enters
-  // forwardAlongWall, which immediately sees the wall too far or something
-  // ahead and bounces straight back out. That single tick used to reset the
-  // clock, so a follower thrashing THROUGH forwardAlongWall never looked lost,
-  // however long it thrashed. Half a second of it is the difference between
-  // actually following a wall and glancing off the state on the way past.
-  if (wf_state == forwardAlongWall) {
+  // SUSTAINED following, not a touch. A machine that bounces through the
+  // following state one tick at a time is not following anything, and letting
+  // that reset the clock is what allowed an eleven-second corner oscillation to
+  // run all the way to a crash with the give-up never firing.
+  if (sf_state == SF_FOLLOW) {
     if (following_streak < 255) following_streak++;
     if (following_streak >= FOLLOW_CONFIRM_TICKS) {
       last_following_tick = xTaskGetTickCount();
@@ -1016,42 +1251,21 @@ static void wfTick(void) {
     following_streak = 0;
   }
 
-  // Cap the rotation -- and slow the TRANSLATION by the same factor.
-  //
-  // Capping the turn rate alone was a real bug, and it cost two crashed
-  // corners. The follower does not pick a turn rate independently; around an
-  // outside corner it DERIVES one from the forward speed to fly a particular
-  // arc:
-  //
-  //     cmdVelX = maxForwardSpeed;
-  //     cmdAngW = direction * (-cmdVelX / radius);
-  //
-  // The radius is what matters -- it is set to the wall distance, so the
-  // aircraft curves around the corner at the range it was already holding.
-  // Clamping the yaw rate while leaving the speed alone changes that radius:
-  // 0.2 m/s against a 20 deg/s cap arcs at 0.57m instead of the 0.4m intended,
-  // so the aircraft runs wide and stops tracking the wall it is turning around.
-  //
-  // Scaling the velocity by the same factor keeps vx/omega, and therefore the
-  // radius, exactly as the controller intended. The corner is flown on the same
-  // path, just more slowly. States that rotate on the spot already have vx = 0,
-  // so scaling costs them nothing.
-  float yawRateDeg = yawRateRad * RAD2DEG;
-  float yawMag = yawRateDeg < 0.0f ? -yawRateDeg : yawRateDeg;
-  if (yawMag > WF_MAX_YAWRATE_DEG) {
-    float scale = WF_MAX_YAWRATE_DEG / yawMag;
-    yawRateDeg *= scale;
-    vx *= scale;
-    vy *= scale;
-  }
+  // A hard ceiling on rotation. Capping the old follower's yaw was a real bug,
+  // because it derived turn rate from forward speed to fly a particular arc and
+  // capping one without the other changed the radius. Nothing here does that:
+  // every turn is commanded stopped, so a cap can only make a turn take longer,
+  // never move it.
+  if (yawDeg >  SF_TURN_RATE_DEG) yawDeg =  SF_TURN_RATE_DEG;
+  if (yawDeg < -SF_TURN_RATE_DEG) yawDeg = -SF_TURN_RATE_DEG;
 
   // Never fly into anything. Applied to the TARGET, so the ramp below
   // decelerates into the stop instead of snapping to it.
   clampAwayFromObstacles(&vx, &vy);
 
   // Ease onto the new speed rather than stepping onto it. See WF_ACCEL_MS2:
-  // this is what stops the aircraft sagging every time the follower changes
-  // its mind about where to go.
+  // this is what stops the aircraft sagging every time the commanded velocity
+  // changes, and it is what turns SF_STOP into a smooth deceleration.
   float maxStep = WF_ACCEL_MS2 * 0.1f;   // decisions run at 10Hz
   float dvx = vx - vx_cmd;
   float dvy = vy - vy_cmd;
@@ -1062,7 +1276,7 @@ static void wfTick(void) {
   vx_cmd += dvx;
   vy_cmd += dvy;
 
-  sendBodyVelocity(vx_cmd, vy_cmd, commandedHeight(), yawRateDeg);
+  sendBodyVelocity(vx_cmd, vy_cmd, commandedHeight(), yawDeg);
 }
 
 // --- Using the wall on the way home -----------------------------------------
@@ -1587,7 +1801,7 @@ void appMain(void) {
         // so a second flight on a warm drone would otherwise begin halfway
         // through the previous one's corner.
         vel_active = false;
-        wf_state = forward;
+        sfReset();
         tele_wfstate = 0;
         crumb_x = 0;
         crumb_y = 0;
@@ -1608,28 +1822,16 @@ void appMain(void) {
         brake_v0 = 0.0f;
         home_turn_done = false;
         if (mission_wallfollow) {
-          // Start ALREADY FOLLOWING, not in `forward`.
+          // Start ALREADY FOLLOWING.
           //
-          // This matters more than it looks. The only way out of the `forward`
-          // state is the FRONT sensor seeing something within 60cm -- it does
-          // not look at the side sensor at all. Bitcraze's demo is launched in
-          // the middle of a room, so it flies forward, meets a wall ahead,
-          // turns to find it and then follows.
-          //
-          // CaveBat is launched with the wall already beside the drone and open
-          // space ahead, which is what the app's own instructions ask for. Told
-          // to start in `forward`, the machine therefore never left it: it flew
-          // straight at full speed past the wall it was supposed to follow
-          // until it hit something. That was three crashed flights.
-          //
-          // `forwardAlongWall` is the state that holds the distance and flies
-          // on, which is exactly the situation on the pad. If the wall turns
-          // out to be further than 70cm the machine drops into findCorner and
-          // searches for it, so a sloppy placement degrades into a search
-          // rather than a crash.
-          wallFollowerInit(mission_walldist / 1000.0f, WF_SPEED_MS,
-                           forwardAlongWall);
-          wf_state = forwardAlongWall;
+          // CaveBat is launched with the wall beside the drone and open space
+          // ahead, which is what the app's instructions ask for. That is exactly
+          // what SF_FOLLOW expects, so there is nothing to search for and
+          // nothing to decide. If the wall is further off than expected the
+          // strafe trim closes the gap; if it is not there at all, the
+          // wall-ended branch goes looking for it rather than flying on at
+          // speed. Flying on at speed was three crashed flights.
+          sfReset();
         }
         climb_done_tick = xTaskGetTickCount()
                         + M2T((uint32_t)(takeoff_duration * 1000.0f));
@@ -1800,16 +2002,15 @@ void appMain(void) {
                     // itself on a 20-byte BLE link and arrives after the crash
                     // it was meant to explain.
                     //
-                    // st is the follower's state: 0 forward, 1 hover,
-                    // 2 turnToFindWall, 3 turnToAlignToWall, 4 forwardAlongWall,
-                    // 5 rotateAroundWall, 6 rotateInCorner, 7 findCorner.
+                    // st is the follower's step: 0 follow, 1 stop, 2 turn,
+                    // 3 verify, 4 past, 5 reacquire. See StateSF.
                     // Twice a second through a corner, once a second along a
                     // wall. Corners are where this keeps failing and they last
                     // three to five seconds, so four lines at 1Hz was not
                     // enough to watch one go wrong -- but the straight
                     // stretches are long and uneventful, and printing those
                     // faster would crowd the link for nothing.
-                    uint16_t traceEvery = (wf_state == forwardAlongWall) ? 10 : 5;
+                    uint16_t traceEvery = (sf_state == SF_FOLLOW) ? 10 : 5;
                     if ((tele_alive % traceEvery) == 0) {
                         DEBUG_PRINT("WF%c st=%d f=%d s=%d r=%d p=%d\n",
                                     (active_follow == 2) ? 'L' : 'R',

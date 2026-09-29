@@ -373,6 +373,17 @@ static int16_t crumb_x = 0, crumb_y = 0;
 // Tick at which the braking phase began, so the ramp knows how far along it is.
 static TickType_t brake_start = 0;
 
+// The forward speed the brake ramps down FROM.
+//
+// This only became necessary when the velocity ramp went in. Before it, the
+// aircraft was always flying at exactly WF_SPEED_MS when the brake began, so
+// ramping from that constant was right. With a ramp it is not: the commanded
+// speed is whatever vx_cmd has reached, and the follower may well be stopped
+// mid-corner when the timer fires. Ramping "down" from WF_SPEED_MS then
+// commands a forward LURCH from nearly nothing up to full speed, at the exact
+// moment the aircraft is being handed to the trajectory planner.
+static float brake_v0 = 0.0f;
+
 // The heading the RETURN leg is holding, in radians. Bookkeeping for
 // issueStep, which needs to know the heading it last commanded so it can work
 // out how long a turn should take. 0 = the way the drone faced at takeoff.
@@ -1063,6 +1074,7 @@ void appMain(void) {
         wf_state = CF_FOLLOW;
         vx_cmd = 0.0f;
         vy_cmd = 0.0f;
+        brake_v0 = 0.0f;
         tele_wfstate = 0;
         tilt_peak = 0;
         crumb_x = 0;
@@ -1178,17 +1190,20 @@ void appMain(void) {
                                 (int)tele_x, (int)tele_y);
                     tele_phase = PHASE_BRAKE;
                     brake_start = xTaskGetTickCount();
+                    brake_v0 = vx_cmd;   // ramp down from the REAL speed
                 } else if (waypoint_count >= MAX_WAYPOINTS) {
                     tele_outwhy = 4;
                     DEBUG_PRINT("CAVEBAT: breadcrumb trail full, returning\n");
                     tele_phase = PHASE_BRAKE;
                     brake_start = xTaskGetTickCount();
+                    brake_v0 = vx_cmd;   // ramp down from the REAL speed
                 } else if ((int32_t)(xTaskGetTickCount() - outbound_deadline) >= 0) {
                     tele_outwhy = 1;
                     DEBUG_PRINT("CAVEBAT: half timer, returning over %d points\n",
                                 (int)waypoint_count);
                     tele_phase = PHASE_BRAKE;
                     brake_start = xTaskGetTickCount();
+                    brake_v0 = vx_cmd;   // ramp down from the REAL speed
                 } else {
                     // Fly the wall. wfTick() reads the sensors, runs Bitcraze's
                     // state machine and sends the setpoint; the refresh at the
@@ -1255,7 +1270,7 @@ void appMain(void) {
                 float f = 1.0f - ((float)elapsed / (float)M2T(BRAKE_MS));
                 if (f < 0.0f) f = 0.0f;
                 vel_active = true;
-                sendBodyVelocity(WF_SPEED_MS * f, 0.0f,
+                sendBodyVelocity(brake_v0 * f, 0.0f,
                                  commandedHeight(), 0.0f);
             } else {
                 // Stopped. Hand the aircraft back to the trajectory planner.

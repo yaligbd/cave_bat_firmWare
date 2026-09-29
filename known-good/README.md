@@ -15,3 +15,17 @@ lights blink fast), then from Ubuntu/WSL:
 To regenerate this file from source instead:
 
     make && cp build/cf2.bin known-good/cavebat-v1-flying.bin
+
+## cavebat-v16-corners-work.bin -- the first build that turned corners
+
+Verified 2026-09-29 (tag `v16-corners-work`). Four flights, four successes:
+one hover, three wall-follow-right, and one of those flew **both corners of the
+arena and returned home**. The first time that has ever happened.
+
+Flies a corner as a script -- stop, turn 90 degrees on the spot, verify, carry
+on -- instead of as a blend of states. Yaw only ever happens in discrete turns.
+
+    cfloader flash known-good/cavebat-v16-corners-work.bin stm32-fw
+
+Known faults at this tag: a dip in altitude just before the return leg starts,
+and the 3D view does not match the route closely.

@@ -143,6 +143,39 @@ typedef struct __attribute__((packed)) {
   // inside the 19 that fits one BLE notification.
   int16_t yaw;
   uint8_t front, back, left, right, up, down;   // ranges, 2cm units, 0 = none
+
+  // What the follower was doing, packed into one byte:
+  //   low  4 bits  the step it was in (see wallfollowing_corners.h)
+  //   high 4 bits  the flight mode (0 hover, 1 wall right, 2 wall left)
+  //
+  // WHY THIS IS RECORDED RATHER THAN PRINTED. It used to go out on the
+  // console, and the console does not survive. A wall-following flight came
+  // back missing "Initiating Takeoff", missing the mode line and missing every
+  // line of the trace, with the drone reporting "LOG packets drop detected" --
+  // the crash it was meant to explain left no evidence at all. The console
+  // shares a 20-byte BLE link with three log blocks and loses whatever does
+  // not fit.
+  //
+  // The recording has no such problem: written to memory during the flight,
+  // downloaded afterwards over a quiet link, and every sample of every flight
+  // has arrived intact. The position, heading and ranges were already here --
+  // the decision made from them was the only thing missing.
+  uint8_t wf;
+
+  // The WORST tilt since the previous sample, in 2-degree units.
+  //
+  // A peak, not a snapshot, because samples are a second apart and a flip
+  // takes a fraction of that: an instantaneous reading would miss it entirely.
+  //
+  // This is the measurement that separates the two explanations for a crash.
+  // Tilt CLIMBING across several samples means the controller is fighting a
+  // position estimate it cannot trust, which is a software problem. Tilt near
+  // zero and then suddenly enormous means nothing was fighting anything and
+  // the aircraft hit something, which is not.
+  //
+  // These two bytes take the sample to 16 and the download packet to 19, the
+  // most that fits in a single BLE notification.
+  uint8_t tilt;
 } FlightSample;
 
 // 1Hz sampling, so 180 samples is three minutes -- well past the one minute we
@@ -296,6 +329,9 @@ static setpoint_t wf_setpoint;
 // aircraft was doing rather than leaving us to guess again.
 static int wf_state = CF_FOLLOW;
 static uint8_t tele_wfstate = 0;
+
+// Worst tilt since the last sample, 2-degree units. See FlightSample.tilt.
+static uint8_t tilt_peak = 0;
 
 // The sensors the follower reads. File scope because it runs outside the
 // block where appMain keeps its own log handles.
@@ -865,6 +901,14 @@ void appMain(void) {
       float pitch_now = safeLogFloat(idPitch);
       if (roll_now < 0) roll_now = -roll_now;
       if (pitch_now < 0) pitch_now = -pitch_now;
+      // Worst tilt this second, held until the next sample takes it. Checked
+      // every tick because a tumble is over long before the next sample.
+      {
+        float worst = (roll_now > pitch_now) ? roll_now : pitch_now;
+        uint16_t units = (uint16_t)(worst / 2.0f);
+        if (units > 255) units = 255;
+        if ((uint8_t)units > tilt_peak) tilt_peak = (uint8_t)units;
+      }
       if (roll_now > 15.0f || pitch_now > 15.0f) {
         DEBUG_PRINT("TILT r=%d p=%d z=%d\n",
                     (int)safeLogFloat(idRoll), (int)safeLogFloat(idPitch),
@@ -900,6 +944,11 @@ void appMain(void) {
         fs->right = rangeTo2cm(tele_right);
         fs->up    = rangeTo2cm(tele_up);
         fs->down  = rangeTo2cm(tele_down);
+        // The follower's step and the flight mode, one nibble each.
+        fs->wf    = (uint8_t)((mission_wallfollow & 0x0f) << 4)
+                  | (uint8_t)(tele_wfstate & 0x0f);
+        fs->tilt  = tilt_peak;
+        tilt_peak = 0;   // each sample owns the second before it
         sample_count++;
         tele_samples = sample_count;
       }
@@ -1015,6 +1064,7 @@ void appMain(void) {
         vx_cmd = 0.0f;
         vy_cmd = 0.0f;
         tele_wfstate = 0;
+        tilt_peak = 0;
         crumb_x = 0;
         crumb_y = 0;
         if (mission_wallfollow) {

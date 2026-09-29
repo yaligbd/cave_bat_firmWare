@@ -34,7 +34,12 @@ obj-y += cavebat_multiranger.o
 #                                        first corner on this aircraft.
 #
 # See the header of wallfollowing_tudelft.c for the three places they differ.
-obj-y += wallfollowing_tudelft.o
+#   wallfollowing_corners.o              A corner flown as a script: stop, turn
+#                                        90 on the spot, verify, carry on. No
+#                                        continuous yaw feedback anywhere.
+#                                        CURRENT.
+obj-y += wallfollowing_corners.o
+# obj-y += wallfollowing_tudelft.o
 # obj-y += wallfollowing_multiranger_onboard.o
 # obj-y += cavebat_wall.o
 # obj-y += cavebat.o

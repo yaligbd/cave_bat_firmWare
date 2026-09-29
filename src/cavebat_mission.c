@@ -20,7 +20,7 @@
 #include "crtp_commander_high_level.h"
 #include "stabilizer_types.h"
 #include "crtp.h"
-#include "wallfollowing_tudelft.h"
+#include "wallfollowing_corners.h"
 #include <string.h>
 #include <math.h>
 
@@ -263,7 +263,15 @@ static uint32_t mission_walldist = 400;
 // corners, which was the point, but it turned visibly slower than it needed to
 // and every corner manoeuvre spends that time inside the outbound budget. 20 is
 // still well under Bitcraze's 29 and keeps most of the margin.
-#define WF_MAX_YAWRATE_DEG  20.0f
+#define WF_MAX_YAWRATE_DEG  45.0f
+
+// How fast the commanded velocity may change, m/s^2. See the ramp in wfTick.
+#define WF_ACCEL_MS2        0.4f
+
+// The ramped command, carried between ticks. Reset between flights, or a
+// second flight on a warm drone begins at the speed the last one ended on.
+static float vx_cmd = 0.0f;
+static float vy_cmd = 0.0f;
 
 // Drop a breadcrumb every time the drone has moved this far since the last
 // one. The old controller dropped one per completed hop; there are no hops
@@ -286,7 +294,7 @@ static setpoint_t wf_setpoint;
 
 // Which state the follower is in, published so a crash log says what the
 // aircraft was doing rather than leaving us to guess again.
-static int wf_state = TUD_FORWARD;
+static int wf_state = CF_FOLLOW;
 static uint8_t tele_wfstate = 0;
 
 // The sensors the follower reads. File scope because it runs outside the
@@ -594,7 +602,7 @@ static void wfTick(void) {
   float now_s = (float)xTaskGetTickCount() / (float)configTICK_RATE_HZ;
 
   float vx = 0.0f, vy = 0.0f, yawRateRad = 0.0f;
-  wf_state = wallFollowerTudelft(&vx, &vy, &yawRateRad,
+  wf_state = wallFollowerCorners(&vx, &vy, &yawRateRad,
                                  frontRange, sideRange, yawRad, direction, now_s);
   tele_wfstate = (uint8_t)wf_state;
 
@@ -626,9 +634,29 @@ static void wfTick(void) {
   }
 
   // Last word before the setpoint goes out: never fly into anything.
+  // Applied to the TARGET, so the ramp below decelerates into the stop rather
+  // than snapping to it.
   clampAwayFromObstacles(&vx, &vy);
 
-  sendBodyVelocity(vx, vy, commandedHeight(), yawRateDeg);
+  // Ease onto the new speed rather than stepping onto it.
+  //
+  // Without this the aircraft is commanded straight from one velocity to the
+  // next, and the controller answers a step change by pitching hard -- the dip
+  // that shows on every direction change. The script depends on it too: CF_STOP
+  // asks for a halt and waits CF_STOP_S for it, which is only a smooth
+  // deceleration if something limits the rate of change. 0.4 m/s^2 takes the
+  // cruise speed to zero in half a second, comfortably inside that wait.
+  float maxStep = WF_ACCEL_MS2 * 0.1f;     // decisions run at 10Hz
+  float dvx = vx - vx_cmd;
+  float dvy = vy - vy_cmd;
+  if (dvx >  maxStep) dvx =  maxStep;
+  if (dvx < -maxStep) dvx = -maxStep;
+  if (dvy >  maxStep) dvy =  maxStep;
+  if (dvy < -maxStep) dvy = -maxStep;
+  vx_cmd += dvx;
+  vy_cmd += dvy;
+
+  sendBodyVelocity(vx_cmd, vy_cmd, commandedHeight(), yawRateDeg);
 }
 
 // Give the aircraft back to the high-level commander.
@@ -983,7 +1011,9 @@ void appMain(void) {
         // so a second flight on a warm drone would otherwise begin halfway
         // through the previous one's corner.
         vel_active = false;
-        wf_state = TUD_FORWARD;
+        wf_state = CF_FOLLOW;
+        vx_cmd = 0.0f;
+        vy_cmd = 0.0f;
         tele_wfstate = 0;
         crumb_x = 0;
         crumb_y = 0;
@@ -1007,9 +1037,8 @@ void appMain(void) {
           // out to be further than 70cm the machine drops into findCorner and
           // searches for it, so a sloppy placement degrades into a search
           // rather than a crash.
-          wallFollowerTudelftInit(mission_walldist / 1000.0f, WF_SPEED_MS,
-                                  TUD_FORWARD_ALONG_WALL);
-          wf_state = TUD_FORWARD_ALONG_WALL;
+          wallFollowerCornersInit(mission_walldist / 1000.0f, WF_SPEED_MS);
+          wf_state = CF_FOLLOW;
         }
         climb_done_tick = xTaskGetTickCount()
                         + M2T((uint32_t)(takeoff_duration * 1000.0f));

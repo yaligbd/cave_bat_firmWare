@@ -373,6 +373,21 @@ static int16_t crumb_x = 0, crumb_y = 0;
 // Tick at which the braking phase began, so the ramp knows how far along it is.
 static TickType_t brake_start = 0;
 
+// How many consecutive ticks every ranger has read nothing.
+//
+// A dead Multi-ranger reads 0 on all six, and 0 means "no reading", which every
+// other test in this file correctly treats as open space. That is right for one
+// sensor and catastrophic for all six at once: the follower sees the wall gone,
+// enters the wall-ended branch, and drives forward at cruise speed with the
+// front also reading clear -- a blind aircraft accelerating across a room.
+//
+// The giveaway is DOWN. There is always a floor. A down reading of zero while
+// flying is not open space, it is a deck that has stopped answering, which this
+// one has done before: the I2C expander stops acknowledging and every sensor
+// fails its init.
+static uint8_t deck_silent_ticks = 0;
+#define DECK_SILENT_LIMIT 10   // one second at 10Hz
+
 // The forward speed the brake ramps down FROM.
 //
 // This only became necessary when the velocity ramp went in. Before it, the
@@ -912,6 +927,14 @@ void appMain(void) {
       float pitch_now = safeLogFloat(idPitch);
       if (roll_now < 0) roll_now = -roll_now;
       if (pitch_now < 0) pitch_now = -pitch_now;
+      // Has the ranger deck stopped answering? See deck_silent_ticks.
+      if (tele_front == 0 && tele_back == 0 && tele_left == 0 &&
+          tele_right == 0 && tele_up == 0 && tele_down == 0) {
+        if (deck_silent_ticks < 255) deck_silent_ticks++;
+      } else {
+        deck_silent_ticks = 0;
+      }
+
       // Worst tilt this second, held until the next sample takes it. Checked
       // every tick because a tumble is over long before the next sample.
       {
@@ -1075,6 +1098,7 @@ void appMain(void) {
         vx_cmd = 0.0f;
         vy_cmd = 0.0f;
         brake_v0 = 0.0f;
+        deck_silent_ticks = 0;
         tele_wfstate = 0;
         tilt_peak = 0;
         crumb_x = 0;
@@ -1184,7 +1208,17 @@ void appMain(void) {
                 // whenever the current hop happened to end. Order matters: the
                 // geofence outranks the clock, because too far is a safety
                 // limit while time is up is only a plan.
-                if (beyondGeofence()) {
+                if (deck_silent_ticks >= DECK_SILENT_LIMIT) {
+                    // The rangers have gone. Wall following is impossible
+                    // without them -- but going HOME is not: the trail is
+                    // breadcrumbs and the Flow deck, neither of which is on the
+                    // failed deck. So stop following and fly the route back.
+                    tele_outwhy = 7;
+                    DEBUG_PRINT("CAVEBAT: ranger deck silent 1s, returning\n");
+                    tele_phase = PHASE_BRAKE;
+                    brake_start = xTaskGetTickCount();
+                    brake_v0 = vx_cmd;
+                } else if (beyondGeofence()) {
                     tele_outwhy = 2;
                     DEBUG_PRINT("CAVEBAT: geofence at %d,%d mm, returning\n",
                                 (int)tele_x, (int)tele_y);

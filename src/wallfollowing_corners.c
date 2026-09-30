@@ -76,7 +76,40 @@
 
 // Margins on the holding distance rather than bare numbers, so changing the
 // wall distance moves them all together.
-#define CF_CLEAR_MARGIN     0.20f  // ahead counts as clear past ref + this
+// STOP FURTHER OUT THAN WE MEAN TO HOLD.
+//
+// This is the difference between a corner that works and one that puts the
+// aircraft on its back, and it took a crash to see it.
+//
+// The wall ahead becomes the wall alongside the moment the turn finishes. So
+// whatever distance the aircraft stops at IS its starting distance from the
+// next wall. Stopping at the holding distance therefore guarantees arriving too
+// close: the ramp carries it in another 50mm, and the turn itself drifts. Two
+// flights in a row measured the result -- stopping with the wall 300mm ahead,
+// then following the next wall at 240-300mm against a 400mm target, with the
+// trim crawling outward at 0.06 m/s and the walls of a 2m arena too short to
+// finish the job. The second corner was then taken 280mm from a wall, and that
+// is where it went over: level at one sample, 118 degrees at the next, on a
+// healthy 4.02V battery.
+//
+// Stopping 150mm further out puts the next wall OUTSIDE the target instead of
+// inside it, so the trim eases in rather than clawing out. Easing in is the
+// safe direction: an error toward open space costs nothing, an error toward the
+// wall costs the aircraft.
+#define CF_STOP_MARGIN      0.15f  // stop this much further out than ref
+
+// Ahead counts as clear past ref + this.
+//
+// Raised with CF_STOP_MARGIN to keep a band between "clear enough to fly" and
+// "close enough to stop". Without one, verifying a turn at 600mm and then
+// stopping again at 550mm leaves 50mm of daylight, and ranger noise alone could
+// bounce the machine between the two. 150mm is wider than the noise.
+//
+// It does assume the wall ahead after a turn is further than 700mm, which in
+// this 2m arena it is -- the flown path is a 1.2m square. In a narrower
+// corridor this would read as a dead end, and the answer to a dead end is
+// another 90 degrees and back out, which is wrong but safe.
+#define CF_CLEAR_MARGIN     0.30f
 #define CF_LOST_MARGIN      0.40f  // side past ref + this: the wall ended
 #define CF_FOUND_MARGIN     0.25f  // side inside ref + this: a wall is there
 
@@ -140,7 +173,7 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
 
   // A zero reading means the laser saw nothing, which at these ranges means
   // far away rather than touching. Everything below reads zero as open space.
-  bool frontBlocked = frontRange > 0.0f && frontRange < ref_distance;
+  bool frontBlocked = frontRange > 0.0f && frontRange < ref_distance + CF_STOP_MARGIN;
   bool frontClear   = frontRange <= 0.0f || frontRange > ref_distance + CF_CLEAR_MARGIN;
   bool sideGone     = sideRange  <= 0.0f || sideRange  > ref_distance + CF_LOST_MARGIN;
   bool sideFound    = sideRange  >  0.0f && sideRange  < ref_distance + CF_FOUND_MARGIN;

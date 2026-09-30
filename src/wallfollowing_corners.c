@@ -123,55 +123,31 @@
 #define CF_MAX_TURNS        4      // turns without following = going in circles
 #define CF_TRIM_GAIN        0.6f   // strafe per metre of distance error
 
-// HOLD THE HEADING WHILE FOLLOWING.
+// NO CONTINUOUS YAW AT ALL WHILE FOLLOWING. Rule 1, restored.
 //
-// This closes the last hole, and it is one I put there. Rule 1 said yaw only
-// ever happens in discrete turns, because every version that oscillated
-// computed a yaw rate continuously from a RANGE reading -- a loop through the
-// wall geometry. That reasoning was right, and removing that loop is what made
-// corners work. But "no yaw at all" went too far: with nothing holding the
-// heading, the aircraft yaws slowly on its own, and a nose that drifts curves
-// the flight path into the wall faster than a sideways trim can push it out.
+// A heading hold lived here for two builds and is worth recording, because the
+// reasoning was sound and the result was not.
 //
-// Measured, on the flight that prompted this: over four seconds of ordinary
-// following the heading wandered from -167 to -157 degrees, and the wall came
-// in from 380mm to 280mm with the trim pushing the other way the whole time.
-// It then tried to stop for the next corner at 280mm and went over -- the same
-// too-close condition that the standoff fix was meant to have removed.
+// The problem it solved was real: with nothing holding the heading the nose
+// drifts, and a drifting nose curves the path into the wall faster than the
+// sideways trim can push it out. That was measured -- ten degrees over four
+// seconds, the wall closing 380mm to 280mm, and a crash.
 //
-// The distinction that matters: this loop is closed on the ESTIMATOR'S OWN YAW,
-// not on a range. It answers "am I pointing where I was pointing", which has
-// nothing to do with where the wall is, so it cannot fight the wall or oscillate
-// against the corner geometry. It is a heading hold, not a wall follower.
+// But holding a heading only helps if the heading is right. Placed thirteen
+// degrees off parallel, the hold kept the aircraft thirteen degrees off
+// parallel for the whole leg, so it crabbed: forward flight pushed it sideways
+// at 45mm/s and the trim spent everything it had cancelling that instead of
+// closing the gap. Net progress 12mm/s, corner in six seconds, crash. Adding an
+// alignment trim on top was a fix for a fix, and by then the honest position
+// was that the aircraft flew better before either of them existed.
 //
-// Deliberately weak and capped. Correcting ten degrees takes a couple of
-// seconds, which is all the authority needed to cancel a 2.5 deg/s drift, and
-// far too little to throw the aircraft at anything.
-#define CF_HOLD_GAIN        0.5f   // deg/s per degree of heading error
-#define CF_HOLD_MAX_DEG    10.0f   // ceiling on the correction
-
-// TURN THE HELD HEADING TOWARDS PARALLEL, slowly.
+// So this is back to a drone that yaws only in discrete 90 degree turns. It
+// will drift. What stops the drift killing it is CF_BACKOFF below, which
+// refuses to turn a corner from too close and eases out first -- treating the
+// symptom directly rather than adding another loop to prevent it.
 //
-// Holding a heading fixed the drift. It did not fix being pointed the wrong way
-// in the first place, and the flight that prompted this shows the cost. The
-// aircraft was placed about 13 degrees off parallel to the wall, and the hold
-// faithfully kept it there for the whole leg -- so it crabbed: flying forward
-// at 13 degrees pushes it sideways at 45mm/s, and the trim's whole authority
-// went on cancelling that instead of closing the 100mm gap it had started with.
-// Net progress was 12mm/s. Reaching the target distance would have taken 13
-// seconds and the corner arrived in six, so it turned at 300mm and went over.
-//
-// The correction needs no new sensor. A persistent sideways command IS the
-// symptom: if the aircraft must keep strafing away from the wall to hold
-// station, its nose is pointed into the wall. So the held heading is nudged in
-// proportion to that command, which drives the strafe towards zero and the
-// aircraft towards parallel.
-//
-// This is a loop through a range reading, which rule 1 warned about -- but at
-// two degrees per second, against a corner turn of thirty. It cannot oscillate
-// at any timescale the aircraft can fly, and it stops as soon as the strafe
-// does.
-#define CF_ALIGN_RATE     0.035f   // radians of held heading per (m/s) of strafe
+// If that turns out to be wrong, the heading-hold build is tagged
+// v17-heading-hold and kept at known-good/cavebat-option2-heading-hold.bin.
 
 // HOW CLOSE IS TOO CLOSE TO TURN.
 //
@@ -192,7 +168,6 @@ static float max_speed = 0.2f;
 static int   state = CF_FOLLOW;
 static float state_start = 0.0f;
 static float goal_heading = 0.0f;
-static float hold_heading = 0.0f;   // the heading FOLLOW keeps, see CF_HOLD_GAIN
 static float past_travelled = 0.0f;
 static int   turns_without_following = 0;
 static bool  first_run = true;
@@ -204,7 +179,6 @@ void wallFollowerCornersInit(float refDistanceFromWall, float maxSpeed)
   state = CF_FOLLOW;
   state_start = 0.0f;
   goal_heading = 0.0f;
-  hold_heading = 0.0f;
   past_travelled = 0.0f;
   turns_without_following = 0;
   first_run = true;
@@ -231,14 +205,8 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
 {
   if (first_run) {
     state_start = now;
-    hold_heading = currentHeading;
     first_run = false;
   }
-
-  // Track the heading whenever we are NOT following, and freeze it the moment
-  // we are. So the heading FOLLOW holds is whatever the last turn ended on,
-  // with no extra bookkeeping to get out of step.
-  if (state != CF_FOLLOW) hold_heading = currentHeading;
 
   const float dir = (float)direction;
 
@@ -275,23 +243,10 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
     if (trim >  lim) trim =  lim;
     if (trim < -lim) trim = -lim;
 
-    // Hold the heading the last turn ended on. Closed on our own yaw, never
-    // on a range -- see CF_HOLD_GAIN for why that distinction is the whole
-    // point.
-    float hErrDeg = wrapToPi(hold_heading - currentHeading) * RAD2DEG_F;
-    wDeg = hErrDeg * CF_HOLD_GAIN;
-    if (wDeg >  CF_HOLD_MAX_DEG) wDeg =  CF_HOLD_MAX_DEG;
-    if (wDeg < -CF_HOLD_MAX_DEG) wDeg = -CF_HOLD_MAX_DEG;
-
     vx = max_speed;
     vy = -dir * trim;
+    wDeg = 0.0f;               // rule 1: no continuous yaw while following
     turns_without_following = 0;
-
-    // Towards parallel. See CF_ALIGN_RATE: a sideways command that will not go
-    // away means the nose is wrong, so lean the held heading into it. The sign
-    // works out the same on both walls -- strafing right wants a lower heading,
-    // strafing left a higher one, whichever side the wall is on.
-    hold_heading = wrapToPi(hold_heading + vy * CF_ALIGN_RATE);
     break;
   }
 

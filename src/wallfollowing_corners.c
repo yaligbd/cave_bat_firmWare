@@ -150,6 +150,42 @@
 #define CF_HOLD_GAIN        0.5f   // deg/s per degree of heading error
 #define CF_HOLD_MAX_DEG    10.0f   // ceiling on the correction
 
+// TURN THE HELD HEADING TOWARDS PARALLEL, slowly.
+//
+// Holding a heading fixed the drift. It did not fix being pointed the wrong way
+// in the first place, and the flight that prompted this shows the cost. The
+// aircraft was placed about 13 degrees off parallel to the wall, and the hold
+// faithfully kept it there for the whole leg -- so it crabbed: flying forward
+// at 13 degrees pushes it sideways at 45mm/s, and the trim's whole authority
+// went on cancelling that instead of closing the 100mm gap it had started with.
+// Net progress was 12mm/s. Reaching the target distance would have taken 13
+// seconds and the corner arrived in six, so it turned at 300mm and went over.
+//
+// The correction needs no new sensor. A persistent sideways command IS the
+// symptom: if the aircraft must keep strafing away from the wall to hold
+// station, its nose is pointed into the wall. So the held heading is nudged in
+// proportion to that command, which drives the strafe towards zero and the
+// aircraft towards parallel.
+//
+// This is a loop through a range reading, which rule 1 warned about -- but at
+// two degrees per second, against a corner turn of thirty. It cannot oscillate
+// at any timescale the aircraft can fly, and it stops as soon as the strafe
+// does.
+#define CF_ALIGN_RATE     0.035f   // radians of held heading per (m/s) of strafe
+
+// HOW CLOSE IS TOO CLOSE TO TURN.
+//
+// Three crashes have now happened the same way: a corner taken 280-300mm from
+// the wall alongside. Stopping pitches the aircraft up, turning sweeps its
+// rotors, and that close to a wall the two together are what puts it on its
+// back. The standoff fix moved the stop further from the wall AHEAD; this is
+// the wall BESIDE, which it never addressed.
+//
+// So a corner that arrives while too close is not refused, it is postponed:
+// ease out to the holding distance first, then stop and turn. Costs a second.
+#define CF_TURN_MIN_SIDE   0.35f   // metres; under this, back off before turning
+#define CF_BACKOFF_MS      3.0f    // and give up easing out after this long
+
 static float ref_distance = 0.4f;
 static float max_speed = 0.2f;
 
@@ -219,7 +255,15 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
   switch (state) {
 
   case CF_FOLLOW: {
-    if (frontBlocked) { state = enter(CF_STOP, now); break; }
+    if (frontBlocked) {
+      // Too close to turn here. See CF_TURN_MIN_SIDE.
+      if (sideRange > 0.0f && sideRange < CF_TURN_MIN_SIDE) {
+        state = enter(CF_BACKOFF, now);
+      } else {
+        state = enter(CF_STOP, now);
+      }
+      break;
+    }
     if (sideGone)     { past_travelled = 0.0f; state = enter(CF_PAST, now); break; }
 
     // Hold the asked-for distance by strafing, never by turning. Positive
@@ -242,8 +286,32 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
     vx = max_speed;
     vy = -dir * trim;
     turns_without_following = 0;
+
+    // Towards parallel. See CF_ALIGN_RATE: a sideways command that will not go
+    // away means the nose is wrong, so lean the held heading into it. The sign
+    // works out the same on both walls -- strafing right wants a lower heading,
+    // strafing left a higher one, whichever side the wall is on.
+    hold_heading = wrapToPi(hold_heading + vy * CF_ALIGN_RATE);
     break;
   }
+
+  case CF_BACKOFF:
+    // Ease straight out from the wall, holding heading, until there is room to
+    // turn. No forward speed: the wall ahead is already inside the stopping
+    // distance, and the only thing wanted here is the other axis.
+    //
+    // It gives up after CF_BACKOFF_MS and turns anyway. That is deliberate. If
+    // the gap will not open, the aircraft is in a space too tight to fix, and
+    // turning from a bad position still beats hovering into the timer with a
+    // wall in front of it.
+    if (sideRange <= 0.0f || sideRange >= ref_distance ||
+        inState > CF_BACKOFF_MS) {
+      state = enter(CF_STOP, now);
+      break;
+    }
+    vx = 0.0f;
+    vy = -dir * (max_speed * 0.5f);   // away from the wall, half speed
+    break;
 
   case CF_STOP:
     // Everything stays zero: this step asks for a halt and waits for the ramp

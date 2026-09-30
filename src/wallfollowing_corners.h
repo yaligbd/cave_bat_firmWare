@@ -19,6 +19,7 @@
 #define CF_PAST    5  // wall ended: driving out past the corner
 #define CF_REACQ   6  // creeping forward until the wall comes back
 #define CF_GAVEUP  7  // holding position, see the .c
+#define CF_BACKOFF 8  // too close to the wall to turn: easing out first
 
 void wallFollowerCornersInit(float refDistanceFromWall, float maxSpeed);
 

@@ -1327,6 +1327,48 @@ void appMain(void) {
                 tele_phase = PHASE_RETURN;
                 DEBUG_PRINT("CAVEBAT: stopped, home over %d pts\n",
                             (int)waypoint_count);
+
+                // ARM THE PLANNER IN THIS TICK. THIS IS THE DIP.
+                //
+                // Found in the firmware's own source, not guessed. Two things
+                // in commander.c and crtp_commander_high_level.c combine:
+                //
+                //   commanderSetSetpoint() at any priority above HIGHLEVEL --
+                //   which is every velocity setpoint this file sends -- calls
+                //   crtpCommanderHighLevelStop(), putting the planner in its
+                //   STOPPED state so it "forgets its current state".
+                //
+                //   crtpCommanderHighLevelGetSetpoint(), when the planner is
+                //   stopped, returns nullSetpoint. Its comment says why: "when
+                //   the HLcommander is stopped, it wants the motors to be off."
+                //
+                // So the instant commanderRelaxPriority() hands control back,
+                // the thing taking over is asking for zero thrust. It stays
+                // that way until a goTo gives the planner a trajectory. Issuing
+                // that goTo on the NEXT tick left 100ms of "motors off" at half
+                // a metre, every single flight.
+                //
+                // That is exactly what the recordings show, and it explains the
+                // detail that ruled everything else out: the aircraft lost
+                // 208mm, 247mm, then 367mm of height with TILT STAYING AT 2
+                // DEGREES. Nothing was fighting anything. It was not pitching,
+                // not correcting, not chasing a bad estimate -- it was simply
+                // not being held up. On the third occasion it did not recover.
+                //
+                // The window is now microseconds instead of 100ms: relax, then
+                // immediately hand the planner a trajectory, with no setpoint
+                // of ours in between to stop it again.
+                if (return_index > 0) {
+                    return_index--;
+                    issueStep(waypoints[return_index].x / 1000.0f,
+                              waypoints[return_index].y / 1000.0f,
+                              waypoints[return_index].z / 1000.0f,
+                              mission_yaw);
+                } else {
+                    // No trail to fly. Land, which arms the planner just the
+                    // same -- what must never happen is leaving it stopped.
+                    tele_phase = PHASE_LANDING;
+                }
             }
 
         } else if (tele_phase == PHASE_RETURN) {

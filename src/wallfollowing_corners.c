@@ -123,12 +123,40 @@
 #define CF_MAX_TURNS        4      // turns without following = going in circles
 #define CF_TRIM_GAIN        0.6f   // strafe per metre of distance error
 
+// HOLD THE HEADING WHILE FOLLOWING.
+//
+// This closes the last hole, and it is one I put there. Rule 1 said yaw only
+// ever happens in discrete turns, because every version that oscillated
+// computed a yaw rate continuously from a RANGE reading -- a loop through the
+// wall geometry. That reasoning was right, and removing that loop is what made
+// corners work. But "no yaw at all" went too far: with nothing holding the
+// heading, the aircraft yaws slowly on its own, and a nose that drifts curves
+// the flight path into the wall faster than a sideways trim can push it out.
+//
+// Measured, on the flight that prompted this: over four seconds of ordinary
+// following the heading wandered from -167 to -157 degrees, and the wall came
+// in from 380mm to 280mm with the trim pushing the other way the whole time.
+// It then tried to stop for the next corner at 280mm and went over -- the same
+// too-close condition that the standoff fix was meant to have removed.
+//
+// The distinction that matters: this loop is closed on the ESTIMATOR'S OWN YAW,
+// not on a range. It answers "am I pointing where I was pointing", which has
+// nothing to do with where the wall is, so it cannot fight the wall or oscillate
+// against the corner geometry. It is a heading hold, not a wall follower.
+//
+// Deliberately weak and capped. Correcting ten degrees takes a couple of
+// seconds, which is all the authority needed to cancel a 2.5 deg/s drift, and
+// far too little to throw the aircraft at anything.
+#define CF_HOLD_GAIN        0.5f   // deg/s per degree of heading error
+#define CF_HOLD_MAX_DEG    10.0f   // ceiling on the correction
+
 static float ref_distance = 0.4f;
 static float max_speed = 0.2f;
 
 static int   state = CF_FOLLOW;
 static float state_start = 0.0f;
 static float goal_heading = 0.0f;
+static float hold_heading = 0.0f;   // the heading FOLLOW keeps, see CF_HOLD_GAIN
 static float past_travelled = 0.0f;
 static int   turns_without_following = 0;
 static bool  first_run = true;
@@ -140,6 +168,7 @@ void wallFollowerCornersInit(float refDistanceFromWall, float maxSpeed)
   state = CF_FOLLOW;
   state_start = 0.0f;
   goal_heading = 0.0f;
+  hold_heading = 0.0f;
   past_travelled = 0.0f;
   turns_without_following = 0;
   first_run = true;
@@ -166,8 +195,14 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
 {
   if (first_run) {
     state_start = now;
+    hold_heading = currentHeading;
     first_run = false;
   }
+
+  // Track the heading whenever we are NOT following, and freeze it the moment
+  // we are. So the heading FOLLOW holds is whatever the last turn ended on,
+  // with no extra bookkeeping to get out of step.
+  if (state != CF_FOLLOW) hold_heading = currentHeading;
 
   const float dir = (float)direction;
 
@@ -196,9 +231,16 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
     if (trim >  lim) trim =  lim;
     if (trim < -lim) trim = -lim;
 
+    // Hold the heading the last turn ended on. Closed on our own yaw, never
+    // on a range -- see CF_HOLD_GAIN for why that distinction is the whole
+    // point.
+    float hErrDeg = wrapToPi(hold_heading - currentHeading) * RAD2DEG_F;
+    wDeg = hErrDeg * CF_HOLD_GAIN;
+    if (wDeg >  CF_HOLD_MAX_DEG) wDeg =  CF_HOLD_MAX_DEG;
+    if (wDeg < -CF_HOLD_MAX_DEG) wDeg = -CF_HOLD_MAX_DEG;
+
     vx = max_speed;
     vy = -dir * trim;
-    wDeg = 0.0f;               // rule 1: no continuous yaw, ever
     turns_without_following = 0;
     break;
   }

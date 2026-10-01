@@ -118,7 +118,14 @@
 #define CF_SETTLE_S         0.4f   // let the rangers catch up after a rotation
 #define CF_STOP_S           0.7f   // long enough for the ramp to reach zero
 #define CF_PAST_M           0.30f  // travel past an outward corner before turning
-#define CF_CREEP_MS         0.08f
+// HOW FAR TO GO LOOKING FOR THE WALL AGAIN.
+//
+// A distance, not a time, because distance is the thing that decides whether
+// the wall comes into view. Rounding an outward corner needs roughly the
+// holding distance plus the CF_PAST_M already driven past it -- about 700mm --
+// before the new wall is alongside, so this has to be comfortably more than
+// that without letting the aircraft wander off across a room.
+#define CF_REACQ_MAX_M      1.50f
 #define CF_STEP_TIMEOUT_S   5.0f   // any one step taking longer than this failed
 #define CF_MAX_TURNS        4      // turns without following = going in circles
 #define CF_TRIM_GAIN        0.6f   // strafe per metre of distance error
@@ -341,12 +348,32 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
     break;
 
   case CF_REACQ:
-    // Creep, do not fly. If a wall is about to appear alongside, speed is the
-    // last thing wanted.
-    if (sideFound)      { state = enter(CF_FOLLOW, now); break; }
-    if (frontBlocked)   { state = enter(CF_STOP, now);   break; }
-    if (inState > CF_STEP_TIMEOUT_S) { state = enter(CF_GAVEUP, now); break; }
-    vx = CF_CREEP_MS;
+    // FLY, do not creep. This is the outward corner, and it was failing here.
+    //
+    // The step used to inch forward at 80mm/s, on the reasoning that a wall
+    // about to appear alongside is no place for speed. The arithmetic says
+    // otherwise: 80mm/s against a five second step timeout covers 400mm, and
+    // the new wall does not come into view until the aircraft has travelled
+    // roughly the holding distance plus the CF_PAST_M it already drove past the
+    // corner -- about 700mm. It could never get there. It was not failing to
+    // see the wall, it was giving up before reaching it, every single time.
+    //
+    // The overshoot worry was unfounded anyway. The side ranger reports at
+    // 10Hz, so at cruise the aircraft moves 20mm between readings, against a
+    // 250mm band that counts as finding a wall. There is no version of this
+    // where it slips past unseen.
+    //
+    // So it flies at cruise, and the two things that end it are the two that
+    // should: the wall reappearing alongside, or something close enough ahead
+    // to matter. The front ranger is what makes the speed safe -- CF_STOP is
+    // entered at 550mm, which is a comfortable stop from 200mm/s.
+    if (sideFound)    { state = enter(CF_FOLLOW, now); break; }
+    if (frontBlocked) { state = enter(CF_STOP, now);   break; }
+    // Measured in metres travelled rather than seconds elapsed, so a slower
+    // cruise speed searches the same ground instead of less of it.
+    if (past_travelled >= CF_REACQ_MAX_M) { state = enter(CF_GAVEUP, now); break; }
+    vx = max_speed;
+    past_travelled += max_speed * 0.1f;   // decisions run at 10Hz
     break;
 
   case CF_GAVEUP:

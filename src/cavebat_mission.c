@@ -333,6 +333,21 @@ static uint8_t tele_wfstate = 0;
 // Worst tilt since the last sample, 2-degree units. See FlightSample.tilt.
 static uint8_t tilt_peak = 0;
 
+// How many consecutive ticks the aircraft has been past OVER_TILT_DEG.
+//
+// A downloaded flight came back with 42 samples of which about four were
+// flying: the aircraft went over at the start, and the mission task then
+// recorded it lying on the floor for the rest of the timer -- the same frozen
+// position and the same range readings, over and over, burying the part anyone
+// wanted to look at.
+//
+// Past this angle it is not flying, it is lying down. The Crazyflie's own
+// supervisor has already cut the motors by then, so there is nothing left to
+// command and nothing left worth recording.
+#define OVER_TILT_DEG    70.0f
+#define OVER_TILT_TICKS  10      // one second at 10Hz
+static uint8_t over_ticks = 0;
+
 // The sensors the follower reads. File scope because it runs outside the
 // block where appMain keeps its own log handles.
 static logVarId_t wf_idFront, wf_idLeft, wf_idRight, wf_idYaw, wf_idBack, wf_idUp;
@@ -975,6 +990,19 @@ void appMain(void) {
       float pitch_now = safeLogFloat(idPitch);
       if (roll_now < 0) roll_now = -roll_now;
       if (pitch_now < 0) pitch_now = -pitch_now;
+      // On its back? See over_ticks. Ends the flight rather than recording
+      // the floor until the timer runs out.
+      if (roll_now > OVER_TILT_DEG || pitch_now > OVER_TILT_DEG) {
+        if (over_ticks < 255) over_ticks++;
+      } else {
+        over_ticks = 0;
+      }
+      if (over_ticks == OVER_TILT_TICKS && mission_state == 1) {
+        DEBUG_PRINT("CAVEBAT: over on its side, ending the flight\n");
+        tele_endwhy = 2;
+        mission_state = 2;   // the ordinary abort path: stop, tidy up, idle
+      }
+
       // Has the ranger deck stopped answering? See deck_silent_ticks.
       if (tele_front == 0 && tele_back == 0 && tele_left == 0 &&
           tele_right == 0 && tele_up == 0 && tele_down == 0) {
@@ -1147,6 +1175,7 @@ void appMain(void) {
         vy_cmd = 0.0f;
         brake_v0 = 0.0f;
         deck_silent_ticks = 0;
+        over_ticks = 0;
         tele_wfstate = 0;
         tilt_peak = 0;
         crumb_x = 0;

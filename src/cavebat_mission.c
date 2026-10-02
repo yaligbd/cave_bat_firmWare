@@ -354,7 +354,29 @@ static logVarId_t wf_idFront, wf_idLeft, wf_idRight, wf_idYaw, wf_idBack, wf_idU
 // wall and calls a corner at 600mm ahead. So in normal flight this never
 // engages at all. It is what catches the case the follower got wrong -- like
 // flying into a dead end because the corner never triggered.
-#define WF_STOP_MM       250
+// Stop moving TOWARDS anything inside this, on any of the four sides.
+#define WF_STOP_MM       300
+
+// And inside THIS, actively back away from it.
+//
+// The difference is the whole point, and it took a crash to see. Stopping is
+// not the same as retreating: an aircraft that has merely stopped commanding
+// motion toward a wall is still drifting toward it, on momentum and on an
+// estimator that is quietly wrong. It then sits at 250mm doing nothing while
+// the gap closes, which is exactly what was watched happening -- the front
+// reading creeping down with the aircraft taking no action until it was too
+// late.
+//
+// So below this the velocity is not zeroed, it is reversed. This runs on the
+// final command, after the follower has had its say, so it holds in EVERY step
+// -- including the three seconds of a corner turn, where nothing else looks at
+// the front at all.
+//
+// Gentle on purpose. It only has to out-run a drift of a few centimetres a
+// second, and shoving a quadrotor away from one wall is a good way to introduce
+// it to another.
+#define WF_PUSH_MM       200
+#define WF_PUSH_MS       0.12f
 
 // A low ceiling pushes the flight down this far at most, mm. Anything more and
 // a bad up-reading could fly the aircraft into the floor.
@@ -626,10 +648,36 @@ static void clampAwayFromObstacles(float *vx, float *vy) {
   float l = safeLogFloat(wf_idLeft);
   float r = safeLogFloat(wf_idRight);
 
-  if (*vx > 0.0f && f > 0.0f && f < (float)WF_STOP_MM) *vx = 0.0f;
-  if (*vx < 0.0f && b > 0.0f && b < (float)WF_STOP_MM) *vx = 0.0f;
-  if (*vy > 0.0f && l > 0.0f && l < (float)WF_STOP_MM) *vy = 0.0f;
-  if (*vy < 0.0f && r > 0.0f && r < (float)WF_STOP_MM) *vy = 0.0f;
+  // 0 means the laser saw nothing, which at these ranges means far away.
+  bool fNear = f > 0.0f && f < (float)WF_STOP_MM;
+  bool bNear = b > 0.0f && b < (float)WF_STOP_MM;
+  bool lNear = l > 0.0f && l < (float)WF_STOP_MM;
+  bool rNear = r > 0.0f && r < (float)WF_STOP_MM;
+
+  // First: never move towards anything close.
+  if (*vx > 0.0f && fNear) *vx = 0.0f;
+  if (*vx < 0.0f && bNear) *vx = 0.0f;
+  if (*vy > 0.0f && lNear) *vy = 0.0f;
+  if (*vy < 0.0f && rNear) *vy = 0.0f;
+
+  // Then: if something is closer still, back away from it. See WF_PUSH_MM.
+  //
+  // The opposite side is checked before pushing, because in a gap narrower than
+  // two push distances both sides are close at once and backing away from one
+  // means flying into the other. Pinned between two walls, holding still is the
+  // only honest answer -- and the mission timer will take it home from there.
+  bool fPush = f > 0.0f && f < (float)WF_PUSH_MM;
+  bool bPush = b > 0.0f && b < (float)WF_PUSH_MM;
+  bool lPush = l > 0.0f && l < (float)WF_PUSH_MM;
+  bool rPush = r > 0.0f && r < (float)WF_PUSH_MM;
+
+  if (fPush && !bPush)      *vx = -WF_PUSH_MS;   // wall ahead, ease back
+  else if (bPush && !fPush) *vx =  WF_PUSH_MS;
+  else if (fPush && bPush)  *vx =  0.0f;
+
+  if (lPush && !rPush)      *vy = -WF_PUSH_MS;   // wall to the left, ease right
+  else if (rPush && !lPush) *vy =  WF_PUSH_MS;
+  else if (lPush && rPush)  *vy =  0.0f;
 }
 
 // How high to fly right now, in metres.

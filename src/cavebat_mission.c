@@ -1424,9 +1424,20 @@ void appMain(void) {
             // beats the supervisor cutting the motors at altitude. Skipped
             // during the climb, where spin-up sag is worst, and requires the
             // reading to persist so one dip cannot end a flight.
-            if (!mission_guards) {
-                lowbat_streak = 0;
-            } else if ((int32_t)(xTaskGetTickCount() - climb_done_tick) < 0) {
+            //
+            // NOT GATED ON mission.guards ANY MORE, and that gate cost two
+            // aircraft. The parameter defaults to 0, which switched off the
+            // obstacle abort -- sensible, because that one fires on the wall
+            // being followed -- but it switched this off with it. Two flights
+            // then flipped during a turn on a pack resting at 3.80V, which is
+            // exactly the moment of highest current draw and exactly what this
+            // check exists to catch.
+            //
+            // There is no case where flying on a collapsing battery beats
+            // landing on one, so this is no longer a choice. The obstacle abort
+            // below stays optional, because it has a real false-positive mode
+            // and this does not.
+            if ((int32_t)(xTaskGetTickCount() - climb_done_tick) < 0) {
                 lowbat_streak = 0;
             } else if (tele_vbat > 0 &&
                        tele_vbat < (mission_minvbat - VBAT_INFLIGHT_MARGIN_MV)) {

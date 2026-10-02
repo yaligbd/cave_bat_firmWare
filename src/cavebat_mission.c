@@ -225,6 +225,21 @@ static uint32_t mission_walldist = 400;
 // purpose: more sensor readings per metre travelled.
 #define STEP_SPEED_MS    0.2f
 
+// Close enough to a breadcrumb to call it reached, mm.
+//
+// Breadcrumbs are dropped every WF_CRUMB_MM, so this must be well under that
+// or the aircraft arrives at the next one before leaving the last.
+#define RETRACE_ARRIVE_MM  150
+
+// Give up on a breadcrumb that will not come closer, ms.
+//
+// The guarded return can be held off a crumb by an obstacle between it and the
+// aircraft -- which is the whole point, but it must not become a standoff. The
+// trail has many crumbs and they all lead home, so abandoning one and aiming at
+// the next costs almost nothing.
+#define RETRACE_STUCK_MS  5000
+static TickType_t crumb_since = 0;
+
 // Unit conversions: degrees <-> radians.
 #define DEG2RAD          0.017453292f
 #define RAD2DEG          57.29578f
@@ -437,8 +452,8 @@ static uint8_t deck_silent_ticks = 0;
 static float brake_v0 = 0.0f;
 
 // The heading the RETURN leg is holding, in radians. Bookkeeping for
-// issueStep, which needs to know the heading it last commanded so it can work
-// out how long a turn should take. 0 = the way the drone faced at takeoff.
+// the landing, which turns back to it. 0 = the way the drone faced at takeoff.
+// The return holds this heading rather than steering to it.
 static float mission_yaw = 0.0f;
 
 // The heading the drone ACTUALLY has, in radians, read from the estimator.
@@ -459,9 +474,7 @@ static float wrapYaw(float y) {
 
 // SAFETY: if a hop hasn't finished this long after it should have, move on
 // anyway. Stops one stuck hop from leaving the drone hanging in the air.
-#define STEP_GRACE_MS    1500
 
-static float last_turn_deg = 0.0f;
 
 // --- Breadcrumbs --------------------------------------------------------------
 //
@@ -518,8 +531,6 @@ static uint8_t tele_outwhy = 0;
 static int16_t tele_yaw = 0;
 
 // The hop currently in progress, if any, and its time limits.
-static bool       step_active = false;
-static TickType_t step_deadline = 0;
 static TickType_t outbound_deadline = 0;
 static uint16_t   return_index = 0;
 
@@ -543,57 +554,9 @@ static bool beyondGeofence(void) {
 // is; over dozens of steps that difference accumulates and the breadcrumb
 // trail stops matching the flight. Every target here is computed from the
 // estimated position and sent in world coordinates.
-static void issueStep(float tx_m, float ty_m, float tz_m, float yaw_rad) {
-  float dx = tx_m - (tele_x / 1000.0f);
-  float dy = ty_m - (tele_y / 1000.0f);
-  float dist = sqrtf(dx * dx + dy * dy);
-  float dur  = dist / STEP_SPEED_MS;
-  // A floor, or short hops are commanded violently.
-  //
-  // 0.7s was too low once the trail became dense. A 300mm hop flown in 0.7s is
-  // 0.43 m/s -- more than TWICE the speed the outbound leg flies at -- so the
-  // aircraft left every breadcrumb by accelerating hard, and accelerating means
-  // tilting, and tilting costs altitude on a sagging pack. That is the drop
-  // still seen at the start of the return after the braking fix.
-  //
-  // At 1.5s a WF_CRUMB_MM hop is flown at the same speed as the outbound leg,
-  // which is what "go back the way you came" ought to mean.
-  if (dur < 1.5f) dur = 1.5f;
-  // And a ceiling. Every target here is derived from the estimated position,
-  // so if the estimate jumps the computed distance jumps with it, and without
-  // this the drone would be commanded on one long uninterrupted flight to a
-  // place it was never at. Capping the duration caps how far a single bad
-  // reading can carry it before the sensors are consulted again.
-  if (dur > 4.0f) dur = 4.0f;
-  // Turning on the spot covers no distance, so the distance-derived duration
-  // would be the 0.7s floor no matter how far it has to rotate. Give a turn
-  // time proportional to its size instead, or the commander is asked to snap
-  // round faster than the aircraft can follow.
-  float dyaw = wrapYaw(yaw_rad - mission_yaw);
-  if (dyaw < 0) dyaw = -dyaw;
-  last_turn_deg = dyaw * RAD2DEG;
-  float turn_dur = last_turn_deg / 25.0f;   // 25 deg/s, deliberately slow
-  if (turn_dur > dur) dur = turn_dur;
-  if (dur > 4.0f) dur = 4.0f;
-  mission_yaw = wrapYaw(yaw_rad);
-
-  crtpCommanderHighLevelGoTo(tx_m, ty_m, tz_m, yaw_rad, dur, false);
-  step_active   = true;
-  step_deadline = xTaskGetTickCount()
-                + M2T((uint32_t)(dur * 1000.0f)) + M2T(STEP_GRACE_MS);
-}
 
 // True once the current step is done, or has taken so long that waiting
 // further is worse than moving on.
-static bool stepFinished(void) {
-  if (!step_active) return true;
-  if (crtpCommanderHighLevelIsTrajectoryFinished()) return true;
-  if ((int32_t)(xTaskGetTickCount() - step_deadline) >= 0) {
-    DEBUG_PRINT("CAVEBAT: step timed out, continuing\n");
-    return true;
-  }
-  return false;
-}
 
 static void dropBreadcrumb(void) {
   if (waypoint_count < MAX_WAYPOINTS) {
@@ -1162,9 +1125,7 @@ void appMain(void) {
         // what a pilot expects and what the estimator assumes.
         mission_yaw = 0.0f;
         meas_yaw = 0.0f;
-        last_turn_deg = 0.0f;
         waypoint_count = 0;
-        step_active = false;
         // Every flight starts the follower from scratch. It keeps its state
         // machine, its heading reference and its corner bookkeeping in statics,
         // so a second flight on a warm drone would otherwise begin halfway
@@ -1398,78 +1359,101 @@ void appMain(void) {
                 // exactly this: it tells the planner the live state estimate
                 // and drops the priority in one go, so the next goTo plans
                 // from where the aircraft actually is.
-                releaseToHighLevel();
-                step_active = false;
-                return_index = waypoint_count;   // decremented before first use
+                // NO HANDOVER HERE ANY MORE. The return flies on velocity
+                // setpoints, the same as the outbound leg, so the aircraft
+                // stays on the one control path all the way home.
+                //
+                // Two things fall out of that. Everything the outbound leg is
+                // protected by now protects the return as well -- the clamp,
+                // and backing away from anything inside 200mm -- where before
+                // it flew breadcrumb to breadcrumb on the trajectory planner
+                // and no ranger was consulted once. And the handover that used
+                // to happen HERE, mid-flight at half a metre, happens on the
+                // pad instead: the dip it caused cannot recur, rather than
+                // being fixed.
+                return_index = waypoint_count;
+                if (return_index > 0) return_index--;
+                crumb_since = xTaskGetTickCount();
+                // Hold whatever heading the outbound leg ended on. The aircraft
+                // flies home sideways and backwards, which it does perfectly
+                // well, and keeping rotation out of the return is what keeps
+                // the position estimate the breadcrumbs are expressed in.
+                mission_yaw = wrapYaw(safeLogFloat(wf_idYaw) * DEG2RAD);
                 tele_phase = PHASE_RETURN;
                 DEBUG_PRINT("CAVEBAT: stopped, home over %d pts\n",
                             (int)waypoint_count);
 
-                // ARM THE PLANNER IN THIS TICK. THIS IS THE DIP.
-                //
-                // Found in the firmware's own source, not guessed. Two things
-                // in commander.c and crtp_commander_high_level.c combine:
-                //
-                //   commanderSetSetpoint() at any priority above HIGHLEVEL --
-                //   which is every velocity setpoint this file sends -- calls
-                //   crtpCommanderHighLevelStop(), putting the planner in its
-                //   STOPPED state so it "forgets its current state".
-                //
-                //   crtpCommanderHighLevelGetSetpoint(), when the planner is
-                //   stopped, returns nullSetpoint. Its comment says why: "when
-                //   the HLcommander is stopped, it wants the motors to be off."
-                //
-                // So the instant commanderRelaxPriority() hands control back,
-                // the thing taking over is asking for zero thrust. It stays
-                // that way until a goTo gives the planner a trajectory. Issuing
-                // that goTo on the NEXT tick left 100ms of "motors off" at half
-                // a metre, every single flight.
-                //
-                // That is exactly what the recordings show, and it explains the
-                // detail that ruled everything else out: the aircraft lost
-                // 208mm, 247mm, then 367mm of height with TILT STAYING AT 2
-                // DEGREES. Nothing was fighting anything. It was not pitching,
-                // not correcting, not chasing a bad estimate -- it was simply
-                // not being held up. On the third occasion it did not recover.
-                //
-                // The window is now microseconds instead of 100ms: relax, then
-                // immediately hand the planner a trajectory, with no setpoint
-                // of ours in between to stop it again.
-                if (return_index > 0) {
-                    return_index--;
-                    issueStep(waypoints[return_index].x / 1000.0f,
-                              waypoints[return_index].y / 1000.0f,
-                              waypoints[return_index].z / 1000.0f,
-                              mission_yaw);
-                } else {
-                    // No trail to fly. Land, which arms the planner just the
-                    // same -- what must never happen is leaving it stopped.
-                    tele_phase = PHASE_LANDING;
-                }
             }
 
         } else if (tele_phase == PHASE_RETURN) {
-            if (!stepFinished()) {
-                // let the current leg finish
-            } else {
-                step_active = false;
+            // THE BREADCRUMBS LEAD, THE RANGERS VETO.
+            //
+            // The trail is still what decides where to go -- it is dead
+            // reckoning, but it is the aircraft's own dead reckoning over
+            // ground it has just covered, and it brought the last flight home
+            // to within 13cm. Nothing about the navigation changes.
+            //
+            // What changes is that it is flown rather than delegated. Aiming a
+            // velocity at the next crumb instead of handing the planner a goTo
+            // means the command passes through clampAwayFromObstacles on its
+            // way out, and that one line is the difference between a return
+            // leg that can see and one that cannot.
+            //
+            // Avoiding comes free with it. The clamp zeroes only the component
+            // INTO an obstacle, so the component along it survives -- the
+            // aircraft slides down the wall towards the crumb instead of
+            // pressing into it. That is the behaviour wanted, and it is the
+            // behaviour of code already flying.
+            float tx = waypoints[return_index].x / 1000.0f;
+            float ty = waypoints[return_index].y / 1000.0f;
+            float dx = tx - (tele_x / 1000.0f);
+            float dy = ty - (tele_y / 1000.0f);
+            float dist = sqrtf(dx * dx + dy * dy);
+
+            bool reached = dist < (float)RETRACE_ARRIVE_MM / 1000.0f;
+            bool stuck = (int32_t)(xTaskGetTickCount() - crumb_since)
+                           >= (int32_t)M2T(RETRACE_STUCK_MS);
+
+            if (reached || stuck) {
+                if (stuck && !reached) {
+                    // Something is between us and that crumb. Every crumb on
+                    // the trail leads home, so take the next one rather than
+                    // push.
+                    DEBUG_PRINT("CAVEBAT: crumb %d blocked, skipping\n",
+                                (int)return_index);
+                }
                 if (return_index == 0) {
                     DEBUG_PRINT("CAVEBAT: home, landing\n");
                     tele_phase = PHASE_LANDING;
                 } else {
                     return_index--;
-                    // Heading held, not recomputed. The drone is retracing
-                    // space it has just flown through, so there is nothing to
-                    // look at that it has not already seen, and holding the
-                    // heading keeps rotation out of the return entirely. It
-                    // flies home sideways or backwards, which the aircraft
-                    // does perfectly well, and every sample still carries the
-                    // heading so the map stays correct.
-                    issueStep(waypoints[return_index].x / 1000.0f,
-                              waypoints[return_index].y / 1000.0f,
-                              waypoints[return_index].z / 1000.0f,
-                              mission_yaw);
+                    crumb_since = xTaskGetTickCount();
                 }
+            } else {
+                // The world-frame direction to the crumb, turned into the body
+                // frame the motors think in. Heading is held throughout, so
+                // this comes out as flying backwards and sideways rather than
+                // as a turn.
+                float ux = dx / dist, uy = dy / dist;
+                float c = cosf(meas_yaw), sn = sinf(meas_yaw);
+                float vx =  (ux * c + uy * sn) * STEP_SPEED_MS;
+                float vy = (-ux * sn + uy * c) * STEP_SPEED_MS;
+
+                // The whole reason for the rewrite.
+                clampAwayFromObstacles(&vx, &vy);
+
+                float maxStep = WF_ACCEL_MS2 * 0.1f;
+                float dvx = vx - vx_cmd;
+                float dvy = vy - vy_cmd;
+                if (dvx >  maxStep) dvx =  maxStep;
+                if (dvx < -maxStep) dvx = -maxStep;
+                if (dvy >  maxStep) dvy =  maxStep;
+                if (dvy < -maxStep) dvy = -maxStep;
+                vx_cmd += dvx;
+                vy_cmd += dvy;
+
+                vel_active = true;
+                sendBodyVelocity(vx_cmd, vy_cmd, commandedHeight(), 0.0f);
             }
         }
 
@@ -1492,7 +1476,6 @@ void appMain(void) {
             mission_state = 0; // Reset to idle
             is_flying = false;
             tele_phase = PHASE_IDLE;
-            step_active = false;
         } else {
             // High-level commander automatically maintains position (hovers)
             // after the takeoff trajectory is complete. No explicit API call needed.
@@ -1568,7 +1551,6 @@ void appMain(void) {
         releaseToHighLevel();   // or the land below is overridden, see above
         tele_endwhy = 2;
         tele_phase = PHASE_LANDING;
-        step_active = false;
         DEBUG_PRINT("CAVEBAT: FLIGHT ABORTED, peak %d mm of %d mm asked\n",
                     (int)tele_maxz, (int)mission_height);
         

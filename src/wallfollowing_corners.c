@@ -130,7 +130,7 @@
 #define CF_MAX_TURNS        4      // turns without following = going in circles
 #define CF_TRIM_GAIN        0.6f   // strafe per metre of distance error
 
-// NO CONTINUOUS YAW AT ALL WHILE FOLLOWING. Rule 1, restored.
+// HOLD THE HEADING WHILE FOLLOWING -- SEEDED FROM THE TURN.
 //
 // A heading hold lived here for two builds and is worth recording, because the
 // reasoning was sound and the result was not.
@@ -153,8 +153,31 @@
 // refuses to turn a corner from too close and eases out first -- treating the
 // symptom directly rather than adding another loop to prevent it.
 //
-// If that turns out to be wrong, the heading-hold build is tagged
-// v17-heading-hold and kept at known-good/cavebat-option2-heading-hold.bin.
+// That was tried and it was not enough: with no yaw control the nose wanders
+// about 2.5 deg/s, and a flight on the very next build drifted into the wall
+// again after clearing an outward corner. Both ways round crash. So the hold
+// comes back -- with the thing it was missing.
+//
+// WHAT IT WAS MISSING. The first attempt held whatever heading the aircraft
+// happened to have when following began, which on the opening leg is however it
+// was placed on the floor. Thirteen degrees off parallel, held faithfully, is a
+// crab: forward flight pushes it sideways and the trim spends everything it has
+// cancelling that instead of closing the gap.
+//
+// But after a 90 degree turn the correct heading is not a guess. It is
+// goal_heading, the exact angle the turn aimed at, and the wall it is about to
+// follow is the wall that was in front of it -- perpendicular by construction.
+// So the hold is seeded there, and every leg after the first is right to within
+// the turn tolerance.
+//
+// The opening leg is the only one left to guess at, and CF_ALIGN_RATE below
+// walks it into place: a sideways command that will not go away IS a nose
+// pointed wrongly, so the held heading leans into it until the strafe stops. At
+// two degrees per second it cannot oscillate at any timescale the aircraft
+// flies, and it stops as soon as it has nothing to correct.
+#define CF_HOLD_GAIN        0.5f   // deg/s of correction per degree of error
+#define CF_HOLD_MAX_DEG    10.0f   // ceiling on that correction
+#define CF_ALIGN_RATE     0.035f   // radians of held heading per (m/s) of strafe
 
 // HOW CLOSE IS TOO CLOSE TO TURN.
 //
@@ -175,6 +198,7 @@ static float max_speed = 0.2f;
 static int   state = CF_FOLLOW;
 static float state_start = 0.0f;
 static float goal_heading = 0.0f;
+static float hold_heading = 0.0f;   // what FOLLOW steers to, see CF_HOLD_GAIN
 static float past_travelled = 0.0f;
 static int   turns_without_following = 0;
 static bool  first_run = true;
@@ -186,6 +210,7 @@ void wallFollowerCornersInit(float refDistanceFromWall, float maxSpeed)
   state = CF_FOLLOW;
   state_start = 0.0f;
   goal_heading = 0.0f;
+  hold_heading = 0.0f;
   past_travelled = 0.0f;
   turns_without_following = 0;
   first_run = true;
@@ -212,6 +237,9 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
 {
   if (first_run) {
     state_start = now;
+    // The opening leg has nothing better to go on than how it was placed.
+    // CF_ALIGN_RATE corrects it from there.
+    hold_heading = currentHeading;
     first_run = false;
   }
 
@@ -250,10 +278,21 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
     if (trim >  lim) trim =  lim;
     if (trim < -lim) trim = -lim;
 
+    // Steer back to the held heading. Closed on our own yaw, not on a range,
+    // so it cannot fight the wall or oscillate against the corner geometry.
+    float hErrDeg = wrapToPi(hold_heading - currentHeading) * RAD2DEG_F;
+    wDeg = hErrDeg * CF_HOLD_GAIN;
+    if (wDeg >  CF_HOLD_MAX_DEG) wDeg =  CF_HOLD_MAX_DEG;
+    if (wDeg < -CF_HOLD_MAX_DEG) wDeg = -CF_HOLD_MAX_DEG;
+
     vx = max_speed;
     vy = -dir * trim;
-    wDeg = 0.0f;               // rule 1: no continuous yaw while following
     turns_without_following = 0;
+
+    // And walk the held heading towards parallel. See CF_ALIGN_RATE: the sign
+    // works out the same on both walls, because strafing right always wants a
+    // lower heading and strafing left a higher one.
+    hold_heading = wrapToPi(hold_heading + vy * CF_ALIGN_RATE);
     break;
   }
 
@@ -290,6 +329,11 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
   case CF_TURN: {
     float errDeg = wrapToPi(goal_heading - currentHeading) * RAD2DEG_F;
     if (errDeg < CF_TURN_TOL_DEG && errDeg > -CF_TURN_TOL_DEG) {
+      // THE SEED. The wall about to be followed is the wall that was in front
+      // of us, so the angle this turn aimed at IS parallel to it. Taking the
+      // aim rather than the achieved heading also throws away the turn's
+      // overshoot instead of holding it for the whole next leg.
+      hold_heading = goal_heading;
       state = enter(CF_VERIFY, now);
       break;
     }

@@ -225,6 +225,25 @@ static float wrapToPi(float a)
   return a;
 }
 
+// Which step a corner should START in, given how close the wall alongside is.
+//
+// This existed inline in CF_FOLLOW and nowhere else, and that gap crashed an
+// aircraft. It came out of an outward corner, searched for the wall in
+// CF_REACQ, met the next wall head-on at 380mm with the side wall already at
+// 180mm -- both walls close, an inner corner -- and turned anyway, because the
+// step it happened to be in never asked the question. It went over four
+// seconds later.
+//
+// A corner can begin from THREE steps: following along a wall, driving past an
+// outward corner, or searching for a wall that has not come back. Any of them
+// can run into something, so the question belongs in one place all three call,
+// rather than in whichever one it was first noticed in.
+static int startCorner(float sideRange)
+{
+  if (sideRange > 0.0f && sideRange < CF_TURN_MIN_SIDE) return CF_BACKOFF;
+  return CF_STOP;
+}
+
 static int enter(int newState, float now)
 {
   state_start = now;
@@ -258,15 +277,7 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
   switch (state) {
 
   case CF_FOLLOW: {
-    if (frontBlocked) {
-      // Too close to turn here. See CF_TURN_MIN_SIDE.
-      if (sideRange > 0.0f && sideRange < CF_TURN_MIN_SIDE) {
-        state = enter(CF_BACKOFF, now);
-      } else {
-        state = enter(CF_STOP, now);
-      }
-      break;
-    }
+    if (frontBlocked) { state = enter(startCorner(sideRange), now); break; }
     if (sideGone)     { past_travelled = 0.0f; state = enter(CF_PAST, now); break; }
 
     // Hold the asked-for distance by strafing, never by turning. Positive
@@ -379,7 +390,7 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
       state = enter(CF_FOLLOW, now);
       break;
     }
-    if (frontBlocked) { state = enter(CF_STOP, now); break; }
+    if (frontBlocked) { state = enter(startCorner(sideRange), now); break; }
 
     vx = max_speed;
     past_travelled += max_speed * 0.1f;        // decisions run at 10Hz
@@ -412,7 +423,7 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
     // to matter. The front ranger is what makes the speed safe -- CF_STOP is
     // entered at 550mm, which is a comfortable stop from 200mm/s.
     if (sideFound)    { state = enter(CF_FOLLOW, now); break; }
-    if (frontBlocked) { state = enter(CF_STOP, now);   break; }
+    if (frontBlocked) { state = enter(startCorner(sideRange), now); break; }
     // Measured in metres travelled rather than seconds elapsed, so a slower
     // cruise speed searches the same ground instead of less of it.
     if (past_travelled >= CF_REACQ_MAX_M) { state = enter(CF_GAVEUP, now); break; }

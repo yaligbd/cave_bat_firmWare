@@ -656,6 +656,19 @@ static void clampAwayFromObstacles(float *vx, float *vy) {
   if (lPush && !rPush)      *vy = -WF_PUSH_MS;   // wall to the left, ease right
   else if (rPush && !lPush) *vy =  WF_PUSH_MS;
   else if (lPush && rPush)  *vy =  0.0f;
+
+  // AND SLOW DOWN WHILE DOING IT.
+  //
+  // Easing sideways at 120mm/s while still flying forward at 200 is a 31 degree
+  // crab, and a recorded flight arrived at a corner doing exactly that: weaving
+  // off the wall from 180mm back out to 380 and meeting the corner diagonally
+  // at full speed. It lost it within a second of the front going blocked.
+  //
+  // Something inside 200mm is a reason to be careful, not only a reason to move
+  // over. Halving the forward speed while a push is active cuts the crab angle,
+  // buys time for the gap to open before the next decision, and shortens every
+  // stopping distance that follows.
+  if ((lPush || rPush) && *vx > 0.0f) *vx *= 0.5f;
 }
 
 // How high to fly right now, in metres.

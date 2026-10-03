@@ -322,13 +322,38 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
       break;
     }
     vx = 0.0f;
-    vy = -dir * (max_speed * 0.5f);   // away from the wall, half speed
+    // AWAY, which is dir and not -dir.
+    //
+    // +y is left -- clampAwayFromObstacles proves it, by blocking positive vy
+    // when the LEFT reading is near. Following a left wall dir is -1, so the
+    // old -dir gave +0.1: straight at the wall it was trying to escape. Wrong
+    // on both sides, in the one step whose entire job is making clearance.
+    //
+    // The trim in CF_FOLLOW got this right, which is why it never showed up
+    // there: it multiplies -dir by an error that is already negative when too
+    // close, and two negatives pointed it the right way.
+    vy = dir * (max_speed * 0.5f);
     break;
 
   case CF_STOP:
     // Everything stays zero: this step asks for a halt and waits for the ramp
     // in the caller to deliver one, so the nose eases down instead of dipping.
     if (inState >= CF_STOP_S) {
+      // ASK AGAIN BEFORE COMMITTING.
+      //
+      // The clearance was checked on the way INTO this step, and then the
+      // aircraft spent the better part of a second coming to a halt. It drifts
+      // while it does. A recorded flight decided to turn with the wall at about
+      // 400mm and was at 200mm by the time it was turning -- a 3-second
+      // rotation begun from a position that was fine when it was chosen and is
+      // not any more.
+      //
+      // A corner postponed costs a second. A corner taken from 200mm has cost
+      // four aircraft.
+      if (sideRange > 0.0f && sideRange < CF_TURN_MIN_SIDE) {
+        state = enter(CF_BACKOFF, now);
+        break;
+      }
       // Inward corner. Turn AWAY from the wall beside us, which puts the wall
       // that was ahead alongside instead: right when following on the left.
       goal_heading = wrapToPi(currentHeading + dir * QUARTER);

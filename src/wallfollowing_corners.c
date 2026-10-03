@@ -322,7 +322,22 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
       break;
     }
     vx = 0.0f;
-    vy = -dir * (max_speed * 0.5f);   // away from the wall, half speed
+    // AWAY, which is dir and NOT -dir.
+    //
+    // +y is left -- clampAwayFromObstacles proves it by blocking positive vy on
+    // a near LEFT reading. Following a left wall dir is -1, so -dir gave +0.1:
+    // straight at the wall it was trying to escape. Wrong on both sides, in the
+    // one step whose entire job is making clearance.
+    //
+    // Measured on the flight that found it: back-off ran for three seconds and
+    // the wall went 260mm, 260mm, 220mm. It never opened the gap at all, so the
+    // aircraft reached the next corner at 220mm instead of 400 and spent the
+    // rest of the flight in geometry it should never have been in.
+    //
+    // CF_FOLLOW's trim got this right, which is why it never showed there: it
+    // multiplies -dir by an error already negative when too close, and the two
+    // negatives pointed it the right way.
+    vy = dir * (max_speed * 0.5f);   // away from the wall, half speed
     break;
 
   case CF_STOP:

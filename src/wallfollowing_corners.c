@@ -191,6 +191,7 @@
 // ease out to the holding distance first, then stop and turn. Costs a second.
 #define CF_TURN_MIN_SIDE   0.35f   // metres; under this, back off before turning
 #define CF_BACKOFF_MS      3.0f    // and give up easing out after this long
+#define CF_BACKOFF_VX      0.08f   // gentle reverse, to open the gap ahead too
 
 static float ref_distance = 0.4f;
 static float max_speed = 0.2f;
@@ -321,7 +322,14 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
       state = enter(CF_STOP, now);
       break;
     }
-    vx = 0.0f;
+    // Back away from the wall AHEAD as well as the one alongside.
+    //
+    // Commanding vx = 0 is not the same as not moving: the aircraft arrives
+    // here at cruise and coasts while the ramp brings it down, which is how a
+    // flight that entered this step 440mm from the wall ahead was 260mm from it
+    // a second later. Easing gently backwards opens both gaps at once instead
+    // of trading one for the other.
+    vx = -CF_BACKOFF_VX;
     // AWAY, which is dir and not -dir.
     //
     // +y is left -- clampAwayFromObstacles proves it, by blocking positive vy
@@ -339,21 +347,25 @@ int wallFollowerCorners(float *velX, float *velY, float *velW,
     // Everything stays zero: this step asks for a halt and waits for the ramp
     // in the caller to deliver one, so the nose eases down instead of dipping.
     if (inState >= CF_STOP_S) {
-      // ASK AGAIN BEFORE COMMITTING.
+      // NO SECOND CHECK HERE. It was tried and it cost two flights.
       //
-      // The clearance was checked on the way INTO this step, and then the
-      // aircraft spent the better part of a second coming to a halt. It drifts
-      // while it does. A recorded flight decided to turn with the wall at about
-      // 400mm and was at 200mm by the time it was turning -- a 3-second
-      // rotation begun from a position that was fine when it was chosen and is
-      // not any more.
+      // The reasoning was that clearance is checked on the way INTO the stop
+      // and the aircraft drifts while halting, so it should be re-checked
+      // before committing. True, and the wrong answer: sending it back to
+      // CF_BACKOFF leaves it sitting in front of the wall ahead instead of
+      // turning away from it.
       //
-      // A corner postponed costs a second. A corner taken from 200mm has cost
-      // four aircraft.
-      if (sideRange > 0.0f && sideRange < CF_TURN_MIN_SIDE) {
-        state = enter(CF_BACKOFF, now);
-        break;
-      }
+      //   16  front=660  left=320   follow
+      //   17  front=440  left=340   back-off   <- re-check fires
+      //   18  front=260  left=480   stop       <- side fixed, 180mm nearer the front
+      //   19  tilt 176              turn       <- over
+      //
+      // The side was corrected and the front was not, because the aircraft
+      // coasts while easing sideways. Turning is what takes the nose off the
+      // wall ahead, so a corner is better turned than postponed once the stop
+      // has already happened. Two left-hand flights flew the complete mission
+      // without this check and two crashed with it.
+      //
       // Inward corner. Turn AWAY from the wall beside us, which puts the wall
       // that was ahead alongside instead: right when following on the left.
       goal_heading = wrapToPi(currentHeading + dir * QUARTER);

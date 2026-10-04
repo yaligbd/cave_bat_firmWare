@@ -1,0 +1,46 @@
+# Only ONE cavebat_*.c defining appMain() may be built.
+#
+#   cavebat_mission.c  the full life cycle. CURRENT.
+#                      Takes off, follows a wall out for half the timer,
+#                      retraces the route home, lands, records throughout.
+#                      Wall following is OFF unless mission.wallfollow = 1,
+#                      and with it off this behaves exactly like
+#                      cavebat_record.c below.
+#   cavebat_record.c   flies + records onboard + CRTP-14 download. Tag
+#                      v9-lifecycle. The fallback if the mission build misbehaves.
+#   cavebat_wall.c     an earlier wall-following attempt, velocity setpoints.
+#                      Superseded and never flown -- kept only as a record.
+#   cavebat.c          flies, no recording.
+#   cavebat_i2cscan.c  DIAGNOSTIC, does not fly.
+#
+# cavebat_multiranger.c is NOT an appMain - it is the deck driver, replacing
+# the stock one (CONFIG_DECK_MULTIRANGER=n in app-config). It is always built.
+# obj-y += cavebat_record.o
+obj-y += cavebat_mission.o
+obj-y += cavebat_multiranger.o
+# The wall-following state machine. NOT an appMain -- cavebat_mission.c calls
+# into it. Required by the mission build, not optional.
+#
+# TWO implementations of the same algorithm sit in this tree. Build exactly one.
+#
+#   wallfollowing_tudelft.o              TU Delft's SGBA_CF2_App_layer code: the
+#                                        implementation that flew the Science
+#                                        Robotics 2019 office-building
+#                                        experiments and came home. CURRENT.
+#   wallfollowing_multiranger_onboard.o  Bitcraze's app-layer demo version.
+#                                        Flown here for weeks. Corners fail
+#                                        roughly half the time, and its own
+#                                        unmodified Python twin crashed at the
+#                                        first corner on this aircraft.
+#
+# See the header of wallfollowing_tudelft.c for the three places they differ.
+#   wallfollowing_corners.o              A corner flown as a script: stop, turn
+#                                        90 on the spot, verify, carry on. No
+#                                        continuous yaw feedback anywhere.
+#                                        CURRENT.
+obj-y += wallfollowing_corners.o
+# obj-y += wallfollowing_tudelft.o
+# obj-y += wallfollowing_multiranger_onboard.o
+# obj-y += cavebat_wall.o
+# obj-y += cavebat.o
+# obj-y += cavebat_i2cscan.o

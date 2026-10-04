@@ -406,6 +406,31 @@ static logVarId_t wf_idFront, wf_idLeft, wf_idRight, wf_idYaw, wf_idBack, wf_idU
 // second, and shoving a quadrotor away from one wall is a good way to introduce
 // it to another.
 #define WF_PUSH_MM       200
+
+// THE RETURN LEG GETS STRICTER NUMBERS, and it can afford to.
+//
+// Nothing is holding a wall distance on the way home -- the aircraft is flying
+// to breadcrumbs, not following anything -- so there is no reason to let it
+// inside the following distance at all. On the OUTBOUND these same numbers
+// would fight the follower constantly, which routinely sits at 300-350mm while
+// trimming out towards 400.
+//
+// A recorded return went to 120mm from the wall. The protection worked -- it
+// pushed away and recovered to 580mm over five seconds -- but it only engages
+// at 200mm, and by then momentum had already taken it well inside that:
+//
+//   46  right=540
+//   47  right=180
+//   48  right=160
+//   49  right=120
+//   51  right=280
+//   54  right=580
+//
+// The breadcrumbs are part of why. They were dropped on the way out at 240 to
+// 320mm from the wall rather than the 400 asked for, so retracing them aims
+// the aircraft at a line that is already too close, and drift does the rest.
+#define RETURN_STOP_MM   400
+#define RETURN_PUSH_MM   300
 #define WF_PUSH_MS       0.12f
 
 // A low ceiling pushes the flight down this far at most, mm. Anything more and
@@ -620,17 +645,18 @@ static void sendBodyVelocity(float vx, float vy, float z_m, float yawRateDeg) {
 // almost unheard of -- but safeLogFloat() also returns 0 for a sensor that is
 // not fitted, and reading that as an obstacle would freeze a Multi-ranger-less
 // aircraft in place. Losing the 0mm case is the cheaper mistake by far.
-static void clampAwayFromObstacles(float *vx, float *vy) {
+static void clampAwayFromObstaclesAt(float *vx, float *vy,
+                                     float stopMm, float pushMm) {
   float f = safeLogFloat(wf_idFront);
   float b = safeLogFloat(wf_idBack);
   float l = safeLogFloat(wf_idLeft);
   float r = safeLogFloat(wf_idRight);
 
   // 0 means the laser saw nothing, which at these ranges means far away.
-  bool fNear = f > 0.0f && f < (float)WF_STOP_MM;
-  bool bNear = b > 0.0f && b < (float)WF_STOP_MM;
-  bool lNear = l > 0.0f && l < (float)WF_STOP_MM;
-  bool rNear = r > 0.0f && r < (float)WF_STOP_MM;
+  bool fNear = f > 0.0f && f < stopMm;
+  bool bNear = b > 0.0f && b < stopMm;
+  bool lNear = l > 0.0f && l < stopMm;
+  bool rNear = r > 0.0f && r < stopMm;
 
   // First: never move towards anything close.
   if (*vx > 0.0f && fNear) *vx = 0.0f;
@@ -644,10 +670,10 @@ static void clampAwayFromObstacles(float *vx, float *vy) {
   // two push distances both sides are close at once and backing away from one
   // means flying into the other. Pinned between two walls, holding still is the
   // only honest answer -- and the mission timer will take it home from there.
-  bool fPush = f > 0.0f && f < (float)WF_PUSH_MM;
-  bool bPush = b > 0.0f && b < (float)WF_PUSH_MM;
-  bool lPush = l > 0.0f && l < (float)WF_PUSH_MM;
-  bool rPush = r > 0.0f && r < (float)WF_PUSH_MM;
+  bool fPush = f > 0.0f && f < pushMm;
+  bool bPush = b > 0.0f && b < pushMm;
+  bool lPush = l > 0.0f && l < pushMm;
+  bool rPush = r > 0.0f && r < pushMm;
 
   if (fPush && !bPush)      *vx = -WF_PUSH_MS;   // wall ahead, ease back
   else if (bPush && !fPush) *vx =  WF_PUSH_MS;
@@ -656,6 +682,11 @@ static void clampAwayFromObstacles(float *vx, float *vy) {
   if (lPush && !rPush)      *vy = -WF_PUSH_MS;   // wall to the left, ease right
   else if (rPush && !lPush) *vy =  WF_PUSH_MS;
   else if (lPush && rPush)  *vy =  0.0f;
+}
+
+// Wall following keeps the numbers it has always flown with.
+static void clampAwayFromObstacles(float *vx, float *vy) {
+  clampAwayFromObstaclesAt(vx, vy, (float)WF_STOP_MM, (float)WF_PUSH_MM);
 }
 
 // How high to fly right now, in metres.
@@ -1439,8 +1470,11 @@ void appMain(void) {
                 float vx =  (ux * c + uy * sn) * STEP_SPEED_MS;
                 float vy = (-ux * sn + uy * c) * STEP_SPEED_MS;
 
-                // The whole reason for the rewrite.
-                clampAwayFromObstacles(&vx, &vy);
+                // The whole reason for the rewrite -- and on stricter numbers
+                // than wall following uses. See RETURN_PUSH_MM.
+                clampAwayFromObstaclesAt(&vx, &vy,
+                                         (float)RETURN_STOP_MM,
+                                         (float)RETURN_PUSH_MM);
 
                 float maxStep = WF_ACCEL_MS2 * 0.1f;
                 float dvx = vx - vx_cmd;

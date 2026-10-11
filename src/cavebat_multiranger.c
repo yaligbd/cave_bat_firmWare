@@ -1,23 +1,22 @@
-// cavebat_multiranger.c - Bitcraze's Multi-ranger driver with the init made
-// robust. Built INSTEAD of the stock one (CONFIG_DECK_MULTIRANGER=n).
+// cavebat_multiranger.c - Bitcraze's Multi-ranger deck driver with a more
+// robust init. Built instead of the stock driver (CONFIG_DECK_MULTIRANGER=n in
+// app-config).
 //
-// WHY THIS EXISTS
-//   The stock driver failed to initialise its five sensors on maybe a third of
-//   boots. That is not a cosmetic failure: deckTest() returning false makes
-//   system.c skip systemStart() entirely, so the whole firmware never runs --
-//   no flight, no telemetry, every command silently ignored. It blocked work
-//   repeatedly and a power cycle sometimes cleared it and sometimes did not.
+// Why: if any of the five sensors fails to initialise, mrTest() fails, and a
+// failed deck test makes system.c skip systemStart() entirely: no flight, no
+// telemetry, every command silently ignored. The stock init failed this way
+// intermittently.
 //
-// WHAT CHANGED, and why each is a plausible cause of an INTERMITTENT failure
-//   1. The expander writes are checked. pca95x4ConfigOutput/ClearOutput return
-//      a status and the stock driver discards it. That chip gates all five
-//      sensors' reset lines, so if a write is lost every sensor stays in reset
-//      and all five fail -- with nothing saying the expander was at fault.
-//   2. The sensor boot delay is 10ms rather than 2ms. A VL53L1x needs time
-//      after its reset line is released before it answers on I2C, and 2ms sits
-//      close enough to the edge to explain a failure that comes and goes.
-//   3. Each sensor gets three attempts. A transient I2C failure should not
-//      end the boot of the entire aircraft.
+// Changes from upstream:
+//   1. The expander write that releases each sensor's reset line
+//      (pca95x4SetOutput) is checked. If it is lost the sensor stays in
+//      reset. The pca95x4ConfigOutput/ClearOutput results are still not
+//      checked.
+//   2. The sensor boot delay is 10 ms rather than 2 ms. A VL53L1x needs time
+//      after its reset line is released before it answers on I2C.
+//   3. Each sensor gets three attempts, 20 ms apart.
+//   4. The expander is probed at init and re-probed up to 5 times, 50 ms
+//      apart. Init carries on either way; the outcome is only logged.
 //
 // Everything else is unchanged from upstream.
 
@@ -83,11 +82,11 @@ NO_DMA_CCM_SAFE_ZERO_INIT static VL53L1_Dev_t devRight;
 
 static bool mrInitSensor(VL53L1_Dev_t *pdev, uint32_t pca95pin, char *name)
 {
-    // Three attempts. A transient I2C failure should not end the boot of the
-    // entire aircraft, which is what one attempt meant in practice.
+    // Three attempts: one transient I2C failure must not fail the deck test
+    // and, with it, the start of the whole firmware.
     for (int attempt = 1; attempt <= 3; attempt++)
     {
-        // Release this sensor's reset line, via the expander. Checked, unlike
+        // Release this sensor's reset line via the expander. Checked, unlike
         // upstream: if this write is lost the sensor never leaves reset and no
         // amount of waiting will make it answer.
         if (!pca95x4SetOutput(PCA95X4_DEFAULT_ADDRESS, pca95pin))
@@ -97,9 +96,9 @@ static bool mrInitSensor(VL53L1_Dev_t *pdev, uint32_t pca95pin, char *name)
             continue;
         }
 
-        // 10ms, not 2ms. The VL53L1x needs time after reset is released before
-        // it answers on I2C, and 2ms is close enough to the edge to explain a
-        // failure that appears on some boots and not others.
+        // 10 ms, not upstream's 2 ms: the VL53L1x needs time after reset is
+        // released before it answers on I2C, and 2 ms is close enough to the
+        // edge to fail on some boots and not others.
         vTaskDelay(M2T(10));
 
         if (vl53l1xInit(pdev, I2C1_DEV))
@@ -144,6 +143,8 @@ static uint16_t mrGetMeasurementAndRestart(VL53L1_Dev_t *dev)
     }
     else
     {
+        // Status not passed by filterMask: report 32767 mm, which readers
+        // treat as nothing in range.
         range = 32767;
     }
 
@@ -196,8 +197,9 @@ static void mrInit()
     pca95x4Init();
 
     // The expander gates every sensor's reset line, so if it is not answering
-    // nothing below can possibly work. Say so plainly rather than letting five
-    // sensors fail one after another with no indication of the real cause.
+    // no sensor can start. Probe it and say so in the log, rather than leaving
+    // five sensor failures with no indication of the real cause. Init carries
+    // on either way.
     if (!pca95x4Test(PCA95X4_DEFAULT_ADDRESS))
     {
         DEBUG_PRINT("MR: expander 0x20 not answering - retrying\n");

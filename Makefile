@@ -1,11 +1,10 @@
-# Build the CaveBat app layer against the Crazyflie firmware.
+# Build the CaveBat app out of tree against the Crazyflie firmware.
 #
-# NOTE: this must include tools/make/oot.mk, NOT the firmware's top-level
-# Makefile. The firmware uses the Kbuild build system; the old
-# "APP=1 / APP_SOURCE=..." style silently does not work with it.
+# Include tools/make/oot.mk, not the firmware's top-level Makefile: the
+# firmware builds with Kbuild, and the old "APP=1 / APP_SOURCE=..." style
+# silently does nothing.
 #
-# What actually gets compiled is decided by Kbuild and src/Kbuild,
-# not by this file.
+# What gets compiled is listed in Kbuild and src/Kbuild, not here.
 CRAZYFLIE_BASE := /home/lenovo/crazyflie-firmware
 
 OOT_CONFIG := $(PWD)/app-config

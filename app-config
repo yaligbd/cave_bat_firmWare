@@ -2,12 +2,12 @@ CONFIG_APP_ENABLE=y
 CONFIG_APP_PRIORITY=1
 CONFIG_APP_STACKSIZE=350
 
-# The stock Multi-ranger driver is OUT, and src/cavebat_multiranger.c is built
-# in its place: the same driver with a robust init. See the header of that file
-# for why. Turning this back on would register two drivers for the same deck.
+# Stock Multi-ranger driver off: src/cavebat_multiranger.c is built in its
+# place (same driver, more robust init; see its header for why). Enabling this
+# as well would register two drivers for the same deck.
 CONFIG_DECK_MULTIRANGER=n
 
-# NOTE: this file is a kconfig fragment and the result is CACHED in build/.config.
-# Editing it does NOT take effect on the next make. After changing it:
+# Kconfig fragment. The result is cached in build/.config, so an edit here does
+# not take effect on the next plain make. After changing it:
 #     rm -rf build && make
-# Verify with: grep MULTIRANGER build/include/generated/autoconf.h
+# Check with: grep MULTIRANGER build/include/generated/autoconf.h

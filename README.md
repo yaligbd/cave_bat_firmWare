@@ -1,109 +1,185 @@
-# CaveBat firmware
+# Cave Bat firmware
 
-Custom firmware for a Bitcraze Crazyflie 2.x, written in C and running on the drone's STM32F405. It flies an autonomous mission that a phone starts and monitors over Bluetooth Low Energy.
+Firmware for a Bitcraze Crazyflie 2.x nano-quadcopter that explores indoors
+without GPS: it takes off, follows a wall around corners, flies back along its
+own trail, and lands. Written in C as an out-of-tree app for the
+`crazyflie-firmware` platform, running on the drone's STM32F405.
 
-This is the drone-side half of [CaveBat](https://github.com/yaligbd/cave-controller). The phone app lives in that repository.
+It is one of three parts of the Cave Bat project:
 
-<!-- Add a photo of the drone, or a short clip of a mission running. -->
+| Repository | Role |
+|---|---|
+| **cave_bat_firmWare** (this) | Autonomous flight: mission, wall following, return to home, safety, onboard recording |
+| [cave-controller](https://github.com/yaligbd/cave-controller) | React Native phone app: starts and monitors the mission over Bluetooth LE, downloads the recording |
+| [gcs](https://github.com/yaligbd/gcs) | Website and API: stores every flight and replays it in 3D |
 
-## The mission
+![Firmware architecture](docs/firmware-architecture.png)
 
-`cavebat_mission.c` is the current build. One run is a full life cycle:
+## How a mission works
 
-1. Take off to `mission.height`
-2. Fly out for half of `mission.timer`, following a wall if `mission.wallfollow` is on
-3. Retrace the route home
-4. Land
+The phone sets a few parameters and writes `mission.state = 1`. From then on the
+drone flies on its own; the phone watches the telemetry and can abort.
 
-It records a sample throughout, and the app downloads the recording over CRTP port 14 on request.
+1. **Climb** to `mission.height`. The position estimator is reset and allowed
+   to settle on the pad first.
+2. **Outbound.** In hover mode the drone holds position until `mission.timer`
+   runs out, then lands. In wall mode the wall follower
+   (`wallfollowing_corners.c`) keeps `mission.walldist` from a wall on the right
+   or left and turns corners as a script: stop, turn 90° on the spot, verify,
+   carry on.
+3. **Brake** (wall mode). The forward speed ramps to zero over 0.8 s; an instant
+   stop pitches the aircraft up and costs height.
+4. **Return** along the breadcrumb trail (below), then
+5. **land**. The recording stays in RAM for the phone to download.
 
-Safety guards abort the mission on low battery (`mission.minvbat`) or an obstacle closer than `mission.minobst`, and report the reason through `tele.endwhy`.
+![Mission state machine](docs/mission-state-machine.png)
+
+### Return to home
+
+There is no GPS and no map. The Kalman estimator fuses the Flow deck (optical
+flow and a downward laser) with the IMU into a position relative to the takeoff
+point. On the way out the drone saves a **breadcrumb** (x, y and the height
+actually flown) every 150 mm, up to 128 of them. On the way back it flies to
+the breadcrumbs in reverse order at 0.2 m/s, holding its heading so the
+estimate stays consistent. A breadcrumb within 150 mm counts as reached; one
+that cannot be reached within 5 s is skipped.
+
+The Multi-ranger does not steer the return, it only vetoes motion: the velocity
+component into an obstacle is removed, so the drone slides along a wall instead
+of pushing into it. The return is only as accurate as the position estimate:
+drift on the way out moves the whole trail.
+
+### When it turns for home (wall mode)
+
+| `tele.outwhy` | Reason |
+|---|---|
+| 1 | half of `mission.timer` has passed since the climb |
+| 2 | more than 4 m from the takeoff point (geofence) |
+| 4 | the breadcrumb trail is full |
+| 7 | every range sensor has read nothing for 1 s |
+
+### Safety
+
+| Condition | Action |
+|---|---|
+| tilt over 70° for 1 s | abort and land |
+| battery under `minvbat` − 0.6 V for 3 ticks, after the climb | abort and land |
+| `mission.timer` + 30 s since takeoff | land, whatever the phase |
+| `mission.state = 2` from the phone | abort and land |
+| with `guards = 1`: battery under `minvbat`, or an obstacle within `minobst`, on the pad | refuse to take off |
+| with `guards = 1`: an obstacle within `minobst` in flight (ignoring the followed wall) | abort and land |
+
+`tele.endwhy` reports how the flight ended: 1 landed normally, 2 aborted.
+
+## Onboard recording
+
+Once a second in flight the drone stores a 16-byte sample in RAM, up to 180
+samples (3 minutes): position (mm), heading, the six ranges (2 cm units,
+0 = no reading), the wall follower's step and mode, and the worst tilt in that
+second. The recording is cleared at takeoff and lost at power-off; the phone
+downloads it after landing over CRTP port 14.
 
 ## Parameters
 
-The app reads and writes these over the CRTP parameter port.
+The phone reads and writes these over the CRTP parameter port.
 
-### `mission` — what the drone should do
+### `mission`: what to do
 
-| Parameter | Type | Meaning |
+| Name | Type | Default | Meaning |
+|---|---|---|---|
+| `state` | uint8 | 0 | 0 idle, 1 fly, 2 abort |
+| `timer` | uint32 | 10 | mission length, s |
+| `height` | uint32 | 500 | flight height, mm |
+| `wallfollow` | uint8 | 0 | 0 hover, 1 follow a wall on the right, 2 on the left |
+| `walldist` | uint32 | 400 | distance to keep from the wall, mm |
+| `minvbat` | uint32 | 3700 | minimum battery on the pad, mV |
+| `minobst` | uint32 | 200 | obstacle clearance for the guards, mm |
+| `guards` | uint8 | 0 | 1 enables the optional pre-flight and obstacle guards |
+| `sampledist` | uint32 | 10 | not used by the current build |
+
+### `tele`: what the drone reports
+
+Available as parameters and as a `tele` log group. The log group also carries
+`phase`, `outwhy` and `yaw`.
+
+| Name | Type | Meaning |
 |---|---|---|
-| `state` | uint8 | 0 idle, 1 fly, 2 abort |
-| `timer` | uint32 | mission length, seconds |
-| `height` | uint32 | hover altitude, mm |
-| `sampledist` | uint32 | distance between recorded samples |
-| `minvbat` | uint32 | abort below this battery voltage |
-| `minobst` | uint32 | abort below this obstacle distance |
-| `guards` | uint8 | enable the safety guards |
-| `wallfollow` | uint8 | 1 enables wall following |
-| `walldist` | uint32 | target distance from the wall |
-
-### `tele` — what the drone reports
-
-| Parameter | Type | Meaning |
-|---|---|---|
-| `alive` | uint16 | counts up; proves `appMain` is running |
-| `canfly` | uint8 | drone is ready to fly |
-| `clear` | uint8 | path ahead is clear |
-| `maxz` | uint16 | highest altitude reached |
+| `alive` | uint16 | counts up while the app task runs |
+| `canfly` | uint8 | battery is at or above `minvbat` |
+| `clear` | uint8 | nothing within `minobst` |
+| `phase` | uint8 | 0 idle, 1 climb, 2 outbound, 3 return, 4 landing, 5 brake (log only) |
+| `maxz` | uint16 | highest altitude reached, mm |
 | `samples` | uint16 | samples recorded |
-| `endwhy` | uint8 | why the mission ended |
-| `vbat` | uint16 | battery, millivolts |
-| `front` `back` `left` `right` `up` `down` | uint16 | ranges, mm; 0 means no reading |
-| `x` `y` `z` | int16 | position, mm |
+| `endwhy` | uint8 | 1 landed normally, 2 aborted |
+| `vbat` | uint16 | battery, mV |
+| `front` `back` `left` `right` `up` `down` | uint16 | ranges, mm; 0 = no reading |
+| `x` `y` `z` | int16 | estimated position, mm |
 
-The same values are also published as a `tele` log group.
+## Source files
 
-## Modules
+Built (selected in `src/Kbuild`):
 
 | File | Role |
 |---|---|
-| `cavebat_mission.c` | **Current build.** The full life cycle above. |
-| `cavebat_record.c` | Flies and records, without the mission structure. The fallback if the mission build misbehaves. |
-| `cavebat.c` | Flies, no recording. The version that first flew. |
-| `cavebat_wall.c` | An earlier wall-following attempt using velocity setpoints. Superseded, never flown, kept as a record. |
-| `cavebat_i2cscan.c` | Diagnostic. Does not fly. |
-| `cavebat_multiranger.c` | Multi-ranger deck driver, replacing the stock one (`CONFIG_DECK_MULTIRANGER=n` in `app-config`). Always built. |
-| `wallfollowing_multiranger_onboard.c` | Wall-following strategy from Bitcraze, by K. N. McGuire — see the header for the paper it comes from. Not currently built. |
+| `src/cavebat_mission.c` | The app: mission phases, breadcrumbs, return, safety guards, recorder, download |
+| `src/wallfollowing_corners.c/.h` | The wall follower: follow, stop, turn, verify, pass a corner, re-acquire, back off |
+| `src/cavebat_multiranger.c` | Multi-ranger deck driver with a retrying start-up, replacing the stock driver (`CONFIG_DECK_MULTIRANGER=n` in `app-config`) |
 
-Only one `cavebat_*.c` defining `appMain()` may be built at a time. `src/Kbuild` selects it.
+Kept for reference, not built: earlier app versions (`cavebat.c`,
+`cavebat_record.c`, `cavebat_wall.c`, `cavebat_v2.c`, `cavebat_v3.c`), an I2C
+scan diagnostic (`cavebat_i2cscan.c`), and two other wall-following strategies,
+`wallfollowing_multiranger_onboard.c` (Bitcraze) and `wallfollowing_tudelft.c`
+(TU Delft), credited in their headers.
 
 ## Building
 
-Builds against the Bitcraze `crazyflie-firmware` tree as an out-of-tree app, with the ARM GCC toolchain.
+Builds against a checkout of Bitcraze's
+[`crazyflie-firmware`](https://github.com/bitcraze/crazyflie-firmware) with the
+ARM GCC toolchain. Point `CRAZYFLIE_BASE` in the `Makefile` at that checkout,
+then:
 
 ```bash
 make
 ```
 
-Two things that cost real time when they go wrong:
-
-- The app needs `CONFIG_APP_ENABLE=y` to come from the config file the build actually reads. If `appMain` never starts, check which config was picked up before looking for a bug in the code.
-- `make` does not always rebuild changed sources. When a change seems to have no effect, `rm -rf build` and build again.
+- `app-config` must reach the build with `CONFIG_APP_ENABLE=y`. If `appMain`
+  never starts, check which config the build picked up first.
+- The config is cached in `build/.config`. After changing `app-config` or
+  `src/Kbuild`, run `rm -rf build && make`.
 
 ## Flashing
 
-Over a Crazyradio PA.
+Over a Crazyradio PA:
 
-- Hold the power button for 3 seconds to enter bootloader mode.
-- Plug the Crazyradio straight into the machine. A USB hub causes packet loss.
-- On WSL, `usbipd attach` has to be redone after every restart.
-- Unplug the Crazyradio before testing over BLE — the nRF51 disables BLE when it sees radio traffic.
+```bash
+cfloader flash build/cf2.bin stm32-fw
+```
 
-## Notes on BLE
+- Bootloader mode: with the drone off, hold the power button about 3 s until
+  the blue LEDs blink fast.
+- Plug the Crazyradio in directly; a USB hub causes packet loss. On WSL, repeat
+  `usbipd attach` after every restart.
+- Unplug the Crazyradio before flying over BLE: the nRF51 turns BLE off while it
+  sees radio traffic.
 
-The Crazyflie's BLE bridge runs on the nRF51, not the STM32, and two of its properties shape everything above it:
+`known-good/` holds a verified binary for each milestone, so the drone can
+always be put back on a build that flew. See
+[known-good/README.md](known-good/README.md).
 
-- Notifications are capped at 20 bytes, which truncates longer parameter names.
-- The bridge is poll-driven — it needs a continuous stream of null packets to keep delivering data.
+## Bluetooth LE notes
 
-Stock firmware also gates CRTP log streaming behind a connection check that only reports a connected state for the radio link, so log blocks never start over BLE. This firmware bypasses that check, which is what lets the app receive live telemetry.
+The BLE bridge runs on the nRF51, not the STM32:
+
+- Packets are limited to 20 bytes, which truncates long parameter names.
+- It is poll-driven: the phone keeps a stream of null packets going so data
+  keeps flowing back.
+- Stock firmware only starts CRTP log blocks for the radio link. The platform
+  build used here is patched so log blocks also stream over BLE, which gives
+  the phone live telemetry.
 
 ## Hardware
 
-- Bitcraze Crazyflie 2.x (STM32F405)
+- Bitcraze Crazyflie 2.x (STM32F405 + nRF51822)
 - Flow deck v2
 - Multi-ranger deck
-- Crazyradio PA, for flashing
-
-<!-- TODO: the three pending-cavebat-*.bin files in the repo root. If the app downloads them for
-     over-the-air updates, say so here. If they are just build output, delete them and add *.bin to .gitignore. -->
+- Crazyradio PA, for flashing only

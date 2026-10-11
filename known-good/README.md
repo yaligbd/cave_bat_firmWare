@@ -1,31 +1,36 @@
 # known-good
 
-`cavebat-v1-flying.bin` is the exact firmware that was verified flying on
-2026-08-28 (tag `v1-flying`).
+Verified flight binaries, one per milestone. They are committed on purpose
+(`build/` is ignored): if the source ever stops building or flying, the drone
+can be put back on a build that flew without needing the toolchain.
 
-It is committed on purpose, even though `build/` is ignored. If the build ever
-breaks again, you do not need it to work in order to get the drone flying --
-you can flash this file directly.
+Flash one in bootloader mode (drone off, hold power about 3 s until the blue
+LEDs blink fast):
 
-Put the drone in bootloader mode (off, then hold power ~3s until the blue
-lights blink fast), then from Ubuntu/WSL:
+```bash
+cfloader flash known-good/cavebat-v16-corners-work.bin stm32-fw
+```
 
-    cfloader flash known-good/cavebat-v1-flying.bin stm32-fw
+| File | Milestone |
+|---|---|
+| `cavebat-v1-flying.bin` | First flight on custom firmware (2026-08-28) |
+| `cavebat-v2-full-mission.bin` | First full mission |
+| `cavebat-v3-flying-noMR.bin` | Flying without the Multi-ranger deck |
+| `cavebat-v4-flying-withMR.bin` | Flying with the Multi-ranger deck |
+| `cavebat-v6-onboard-recording.bin` | Records the flight onboard for the phone to download |
+| `cavebat-v7-record-robustdeck.bin` | Recording with the retrying Multi-ranger driver |
+| `cavebat-v9-lifecycle.bin` | Full flight life cycle with recording |
+| `cavebat-v10-wallfollow.bin` | Holds a set distance from a wall |
+| `cavebat-v11-turning.bin` | Turns, and records its heading |
+| `cavebat-option2-heading-hold.bin` | Alternative build: heading hold |
+| `cavebat-v15-three-flights-great.bin` | Three good flights |
+| `cavebat-v16-corners-work.bin` | Corners flown as a script: stop, turn 90° on the spot, verify, carry on. Four flights, four successes; one flew both corners of the arena and returned home (2026-09-29) |
 
-To regenerate this file from source instead:
+Known faults at v16: a short altitude dip just before the return leg starts,
+and the 3D view did not match the route closely.
 
-    make && cp build/cf2.bin known-good/cavebat-v1-flying.bin
+To rebuild a binary from source:
 
-## cavebat-v16-corners-work.bin -- the first build that turned corners
-
-Verified 2026-09-29 (tag `v16-corners-work`). Four flights, four successes:
-one hover, three wall-follow-right, and one of those flew **both corners of the
-arena and returned home**. The first time that has ever happened.
-
-Flies a corner as a script -- stop, turn 90 degrees on the spot, verify, carry
-on -- instead of as a blend of states. Yaw only ever happens in discrete turns.
-
-    cfloader flash known-good/cavebat-v16-corners-work.bin stm32-fw
-
-Known faults at this tag: a dip in altitude just before the return leg starts,
-and the 3D view does not match the route closely.
+```bash
+rm -rf build && make && cp build/cf2.bin known-good/<name>.bin
+```

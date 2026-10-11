@@ -38,11 +38,12 @@ drone flies on its own; the phone watches the telemetry and can abort.
 
 There is no GPS and no map. The Kalman estimator fuses the Flow deck (optical
 flow and a downward laser) with the IMU into a position relative to the takeoff
-point. On the way out the drone saves a **breadcrumb** (x, y and the height
-actually flown) every 150 mm, up to 128 of them. On the way back it flies to
-the breadcrumbs in reverse order at 0.2 m/s, holding its heading so the
-estimate stays consistent. A breadcrumb within 150 mm counts as reached; one
-that cannot be reached within 5 s is skipped.
+point. On the way out the drone saves a **breadcrumb** (its estimated x and y)
+every 150 mm, up to 128 of them. On the way back it flies to the breadcrumbs in
+reverse order at 0.2 m/s and at the commanded height, holding its heading so
+the estimate stays consistent. A breadcrumb within 150 mm counts as reached; one
+that cannot be reached within 5 s is skipped. (Each breadcrumb also stores the
+height flown, which the return does not use yet.)
 
 The Multi-ranger does not steer the return, it only vetoes motion: the velocity
 component into an obstacle is removed, so the drone slides along a wall instead

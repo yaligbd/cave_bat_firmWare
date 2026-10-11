@@ -1,14 +1,31 @@
-// cavebat_record.c - the flying firmware, plus recording onto the drone.
+// cavebat_mission.c - CaveBat mission app, the only appMain in this build.
 //
-// A copy of cavebat.c (tag v4-flying-withMR, the version that flies) with one
-// capability added: it records a sample every second while airborne and hands
-// the recording to the app over CRTP port 14 on request.
+// One flight per mission.state = 1 request. Phases, as published in tele.phase:
+//   0 IDLE      on the ground. On a fly request: pre-flight checks (only if
+//               mission.guards = 1), estimator reset (about 2.1 s, blocking),
+//               high-level takeoff
+//   1 CLIMB     wait out the takeoff trajectory
+//   2 OUTBOUND  hover mode (wallfollow 0): hold position for the timer, then
+//               land. Wall mode (1 right, 2 left): follow the wall with
+//               wallfollowing_corners for half the timer, dropping breadcrumbs
+//   5 BRAKE     wall mode: ramp the forward speed to zero over 800 ms
+//   3 RETURN    wall mode: fly the breadcrumbs back in reverse, heading held
+//   4 LANDING   hand back to the high-level commander, land, back to IDLE
+// Aborts (phone, over-tilt, battery, optional obstacle) and a hard time limit
+// (timer + 30 s) end any flight with a landing.
 //
-// Deliberately unchanged from the flying version: the 10Hz loop, high-level
-// commander only, no velocity setpoints, no wall following. An earlier attempt
-// changed all of those at once and the drone flipped on takeoff, leaving four
-// suspects and no way to separate them. If this flips, recording is the cause,
-// because it is the only difference.
+// Timing: the main loop decides at 10 Hz. While velocity setpoints are in use
+// (wall-mode OUTBOUND, BRAKE, RETURN) the setpoint is re-sent every 10 ms
+// during the loop's wait, a 100 Hz refresh.
+//
+// Phone interface: the app writes mission.timer, height, sampledist and
+// wallfollow, then mission.state (1 = fly, 2 = abort). walldist, minvbat,
+// minobst and guards are tunables with safe defaults. Status goes back in the
+// tele.* log group (some also as params): position, the six ranges, battery,
+// yaw, canfly, clear, samples, phase, outwhy, endwhy and maxz.
+//
+// Recorder: one 16-byte FlightSample per second while flying (up to 180, in
+// RAM), downloaded on request over CRTP port 14 (see "Download protocol").
 #include <stdint.h>
 #include <stdbool.h>
 #include "app.h"
@@ -40,146 +57,116 @@ static int16_t  tele_x     = 0;    // mm
 static int16_t  tele_y     = 0;
 static int16_t  tele_z     = 0;
 
-// --- Mission Parameters (Required by App) ---
+// --- Mission parameters (mission.*) ---
 static uint8_t  mission_state = 0; // 0=Idle, 1=Fly, 2=Abort
-static uint32_t mission_timer = 10; // Seconds to hover
-static uint32_t mission_height = 500; // Hover altitude in mm
-static uint32_t mission_sampledist = 10; // cm
+// Seconds. Hover mode: hover time after the climb. Wall mode: the outbound
+// leg gets half of it; the return is bounded only by the hard time limit.
+static uint32_t mission_timer = 10;
+static uint32_t mission_height = 500; // Flight altitude in mm
+static uint32_t mission_sampledist = 10; // cm; unused (recording is 1 Hz)
 
-// --- Battery Safety ---
-// Resting voltage below which takeoff is refused outright. A Crazyflie 2.x
-// LiPo is ~4.2V full and ~3.0V empty; below roughly 3.7V at rest it no longer
-// has the headroom to climb. That failure looks like "took off, never reached
-// altitude, came down early" rather than like a flat battery.
+// --- Battery safety ---
+// Resting voltage below which takeoff is refused (only with
+// mission.guards = 1). A Crazyflie 2.x LiPo is ~4.2 V full and ~3.0 V empty;
+// below about 3.7 V at rest it lacks the headroom to climb, which looks like a
+// weak takeoff rather than a flat battery.
 static uint32_t mission_minvbat = 3700;   // mV, resting threshold, tunable
-// Voltage sags hard under motor load, so the in-flight cutoff must sit below
-// the resting threshold or every flight would abort the instant it lifted.
-//
-// 300mV was measured to be far too tight: a flight starting at 3890mV sagged
-// to 3383mV during the takeoff climb and tripped a 3400mV cutoff, ending the
-// mission at 2cm. Spin-up is the worst moment for sag, so the margin is now
-// 600mV AND the check is suppressed until the climb is done. 3700-600 = 3100mV
-// still sits above the ~3.0V where a Crazyflie cell is genuinely empty.
+// The in-flight cutoff is minvbat minus this margin, because voltage sags hard
+// under motor load. Spin-up sag can exceed 500 mV (3890 mV at rest has been
+// seen at 3383 mV in the climb), so a 300 mV margin is too tight; the check is
+// also suppressed until the climb is done. 3700 - 600 = 3100 mV is still above
+// the ~3.0 V where a cell is empty.
 #define VBAT_INFLIGHT_MARGIN_MV 600
 
-// 1 = healthy enough to attempt takeoff, 0 = too low. Published so the app can
-// show it, instead of letting a doomed flight start and look like a bug.
+// 1 = battery at or above minvbat, 0 = too low. Published so the app can show
+// it before a flight starts.
 static uint8_t  tele_canfly = 0;
 
-// --- Obstacle Safety ---
-// Side clearance below which flight is refused/aborted, in mm. Tunable,
-// because 200mm is easy to trip indoors: a desk edge, a chair, or the pilot
-// standing nearby all sit inside it.
+// --- Obstacle safety ---
+// Clearance in mm on front, back, left and right below which takeoff is
+// refused and an in-flight abort is triggered (both only with
+// mission.guards = 1). Tunable because 200 mm is easy to trip indoors: a desk
+// edge, a chair, or the pilot standing nearby.
 static uint32_t mission_minobst = 200;
 
-// 1 = clear to take off, 0 = something is inside mission_minobst. Published so
-// the app can say WHY it will not fly, instead of the drone hopping a few
-// centimetres and landing, which reads as a broken controller.
+// 1 = nothing inside mission_minobst, 0 = something is. Published so the app
+// can say why the drone will not fly.
 static uint8_t  tele_clear = 0;
 
-// Master switch for CaveBat's own safety guards. OFF by default: every guard
-// added so far has fired on a false positive and ended a healthy flight (a
-// side ranger catching the floor during the climb; normal LiPo sag read as a
-// collapsed battery). With this at 0 nothing in this file will abort a
-// mission -- it flies the timer out and lands normally.
+// Master switch for the pre-flight refusals (battery, obstacle) and the
+// in-flight obstacle abort. Off by default, because these have fired on false
+// positives and ended healthy flights (a side ranger seeing the floor during
+// the climb, normal LiPo sag). tele_canfly and tele_clear are still published
+// either way, as information.
 //
-// tele_canfly and tele_clear are still computed and published either way, so
-// the app can show battery and obstacle status as INFORMATION without any of
-// it stopping a flight.
-//
-// This does NOT disable Bitcraze's supervisor. Tumble detection and the
-// critical-battery cutoff live in the stock firmware and still apply.
-//
-// Set mission.guards = 1 to put the pre-flight refusals and in-flight aborts
-// back on.
+// Not affected by this switch: the in-flight battery abort, the over-tilt
+// abort, the hard time limit, and the stock supervisor (tumble detection,
+// critical-battery cutoff).
 static uint8_t  mission_guards = 0;
 
-// Highest point reached during the last flight, in mm, and why that flight
-// ended. Published so a flight can be judged from the app alone -- no radio
-// script, no second link. The drone reports on itself.
-//   0 = never flown   1 = timer completed   2 = aborted
+// Peak altitude of the last flight in mm, and how that flight ended:
+//   0 = never flown
+//   1 = landed normally (hover timer done, home reached, or hard time limit)
+//   2 = aborted (phone, over-tilt, battery or obstacle)
 static uint16_t tele_maxz   = 0;
 static uint8_t  tele_endwhy = 0;
 
-// 0 means "no reading" (out of range) and must NOT count as an obstacle,
+// 0 means "no reading" (out of range) and must not count as an obstacle,
 // otherwise open space would read as blocked.
 static bool sideBlocked(uint16_t mm) {
   return (mm > 0) && (mm < (uint16_t)mission_minobst);
 }
 
-// logGetFloat() ASSERTs on an invalid id, which halts the drone. A sensor that
-// is not present -- because its deck driver is not in the build, or the deck
-// did not initialise -- yields exactly such an id. Reading through this helper
-// means the firmware runs with or without the Multi-ranger fitted instead of
-// dying on the first read.
+// logGetFloat() asserts on an invalid id, which halts the drone. A variable
+// whose deck driver is not built, or whose deck did not initialise, yields
+// such an id. This returns 0 instead, so the firmware runs with or without the
+// Multi-ranger fitted.
 static float safeLogFloat(logVarId_t id) {
   return logVarIdIsValid(id) ? logGetFloat(id) : 0.0f;
 }
 
-// --- Recording ------------------------------------------------------------
+// --- Onboard flight recorder ----------------------------------------------
 //
-// SIZE IS LOAD-BEARING. A download packet is 1 CRTP header + 2 index bytes +
-// sizeof(FlightSample), and the whole thing must be at most 19 bytes so the BLE
-// layer sends it as ONE 20-byte notification. Split packets arrive corrupted on
-// this hardware -- the nRF51's s130 stack caps ATT_MTU at 23 and it cannot be
-// raised. At 12 bytes the packet totals 15, with room to spare.
+// Size limit: a download packet is 1 CRTP header byte + 2 index bytes +
+// sizeof(FlightSample) and must be at most 19 bytes, so the BLE bridge sends it
+// as one 20-byte notification (the nRF51 s130 stack caps ATT_MTU at 23, and
+// split packets arrive corrupted). The sample is 16 bytes, so the packet is
+// exactly 19: there is no room to grow this struct.
 //
-// That budget is why the ranges are single bytes in 2cm units rather than
-// millimetres: six uint16 ranges plus position would be 18 bytes and push the
-// packet to 21, which fragments. 2cm units cover 0-5.1m, comfortably past the
-// multiranger's 3m ceiling, and 2cm resolution is far finer than anything a
-// cave survey needs. Position stays full-resolution millimetres.
+// That budget is why the ranges are single bytes in 2 cm units (0-5.1 m, past
+// the Multi-ranger's ~3 m limit) while position stays in full millimetres.
+// Packed, in native STM32 (little-endian) order: the field order is the wire
+// format the app parses.
 typedef struct __attribute__((packed)) {
   int16_t x, y, z;                              // position, mm
-  // Which way the drone was pointing, in whole degrees, -180..180.
-  //
-  // Without this the six ranges cannot be placed on a map. "Front says 800mm"
-  // means nothing on its own once the drone can turn -- it is 800mm north on
-  // one sample and 800mm east two seconds later. The path was always drawable
-  // from position alone, which is why this was not needed while yaw was pinned
-  // at zero; the walls never were.
-  //
-  // Two bytes takes the sample to 14 and the download packet to 17, still
-  // inside the 19 that fits one BLE notification.
+  // Measured heading in whole degrees, -180..180. Needed to place the ranges
+  // on a map once the drone turns.
   int16_t yaw;
   uint8_t front, back, left, right, up, down;   // ranges, 2cm units, 0 = none
 
-  // What the follower was doing, packed into one byte:
-  //   low  4 bits  the step it was in (see wallfollowing_corners.h)
-  //   high 4 bits  the flight mode (0 hover, 1 wall right, 2 wall left)
+  // Follower state, one nibble each:
+  //   low  4 bits  follower step, CF_* from wallfollowing_corners.h (0 = has
+  //                not run this flight)
+  //   high 4 bits  flight mode, mission.wallfollow (0 hover, 1 right, 2 left)
+  // Sampled before the state machine runs, so the step is the previous tick's.
+  // The follower only runs in OUTBOUND, so during BRAKE and RETURN the step
+  // stays at the last outbound value.
   //
-  // WHY THIS IS RECORDED RATHER THAN PRINTED. It used to go out on the
-  // console, and the console does not survive. A wall-following flight came
-  // back missing "Initiating Takeoff", missing the mode line and missing every
-  // line of the trace, with the drone reporting "LOG packets drop detected" --
-  // the crash it was meant to explain left no evidence at all. The console
-  // shares a 20-byte BLE link with three log blocks and loses whatever does
-  // not fit.
-  //
-  // The recording has no such problem: written to memory during the flight,
-  // downloaded afterwards over a quiet link, and every sample of every flight
-  // has arrived intact. The position, heading and ranges were already here --
-  // the decision made from them was the only thing missing.
+  // Recorded rather than printed: console text is dropped when the 20-byte BLE
+  // link is busy with log blocks, while the recording is downloaded later over
+  // a quiet link.
   uint8_t wf;
 
-  // The WORST tilt since the previous sample, in 2-degree units.
-  //
-  // A peak, not a snapshot, because samples are a second apart and a flip
-  // takes a fraction of that: an instantaneous reading would miss it entirely.
-  //
-  // This is the measurement that separates the two explanations for a crash.
-  // Tilt CLIMBING across several samples means the controller is fighting a
-  // position estimate it cannot trust, which is a software problem. Tilt near
-  // zero and then suddenly enormous means nothing was fighting anything and
-  // the aircraft hit something, which is not.
-  //
-  // These two bytes take the sample to 16 and the download packet to 19, the
-  // most that fits in a single BLE notification.
+  // Worst of |roll| and |pitch| since the previous sample, in 2-degree units,
+  // saturating at 255. A peak rather than a snapshot, because a flip is over
+  // well within the one-second sample interval. Tilt climbing over several
+  // samples points to the controller fighting a bad position estimate; level
+  // and then suddenly large points to an impact.
   uint8_t tilt;
 } FlightSample;
 
-// 1Hz sampling, so 180 samples is three minutes -- well past the one minute we
-// fly. 180 * 12 = 2.1KB of static RAM.
+// 1 Hz sampling, so 180 samples is three minutes; once full, further samples
+// are dropped. 180 * 16 = 2880 bytes of static RAM.
 #define MAX_SAMPLES 180
 static FlightSample flight_log[MAX_SAMPLES];
 static uint16_t sample_count = 0;
@@ -196,49 +183,44 @@ static uint8_t rangeTo2cm(uint16_t mm) {
 // ============================================================================
 // WALL FOLLOWING - SETTINGS
 // ============================================================================
-// Mission: take off, follow a wall on the RIGHT for half the timer, fly back
-// along the same route, land. Records the whole time.
-//
-// How it moves: small hops ("steps") using goTo, never continuous speed
-// commands. Each hop: read sensors, decide, move, wait until it arrives.
-// Home: every hop drops a "breadcrumb" (its position). Going home = visiting
-// the breadcrumbs in reverse.
+// Wall mode: after the climb, follow a wall for half the timer while dropping
+// a breadcrumb every WF_CRUMB_MM, brake, then fly the breadcrumbs back in
+// reverse and land. All of it is flown on body-frame velocity setpoints.
 
-// Flight mode, set by the app.
-//   0 = hover in place (unchanged behaviour)
+// Flight mode, set by the app:
+//   0 = hover in place
 //   1 = follow a wall on the RIGHT
 //   2 = follow a wall on the LEFT
 //
-// Left following is the exact mirror of right following, not a second copy of
-// the logic. One sign variable flips every turn and every steering correction,
-// so a fix to one is automatically a fix to the other and the two cannot drift
-// apart.
+// Left is the mirror of right, not a second copy of the logic: wfTick() reads
+// the other side ranger and passes direction = -1 to the follower, which flips
+// every turn and steering correction.
 static uint8_t mission_wallfollow = 0;
 
-// Distance to keep from the wall, mm. Set by the app.
+// Distance to keep from the wall, mm. Tunable; read once, at takeoff.
 static uint32_t mission_walldist = 400;
 
-// SAFETY: this far from the takeoff spot = stop and fly home. mm.
+// SAFETY: horizontal distance from the takeoff point (mm) at which the
+// outbound leg ends and the drone turns home. Checked only in wall-mode
+// OUTBOUND.
 #define GEOFENCE_MM     4000
 
-// Speed, m/s, for both the return hops and the wall follower. Slow on
-// purpose: more sensor readings per metre travelled.
+// RETURN speed toward each breadcrumb, m/s. Slow on purpose: more sensor
+// readings per metre travelled.
 #define STEP_SPEED_MS    0.2f
 
 // Close enough to a breadcrumb to call it reached, mm.
 //
-// Breadcrumbs are dropped every WF_CRUMB_MM, so this must be well under that
-// or the aircraft arrives at the next one before leaving the last.
+// Crumbs are at least WF_CRUMB_MM apart (equal to this, 150 mm, at present).
+// A radius larger than the spacing would let one arrival satisfy several
+// crumbs and cut corners on the way home.
 #define RETRACE_ARRIVE_MM  150
 
-// Give up on a breadcrumb that will not come closer, ms.
-//
-// The guarded return can be held off a crumb by an obstacle between it and the
-// aircraft -- which is the whole point, but it must not become a standoff. The
-// trail has many crumbs and they all lead home, so abandoning one and aiming at
-// the next costs almost nothing.
+// Give up on a breadcrumb not reached within this time, ms, and aim at the
+// next one. The obstacle clamp can hold the drone off a crumb; every crumb
+// leads home, so skipping one costs little.
 #define RETRACE_STUCK_MS  5000
-static TickType_t crumb_since = 0;
+static TickType_t crumb_since = 0;   // when the current RETURN target was set
 
 // Unit conversions: degrees <-> radians.
 #define DEG2RAD          0.017453292f
@@ -246,165 +228,99 @@ static TickType_t crumb_since = 0;
 
 // --- How the wall gets followed ---------------------------------------------
 //
-// This is NOT our own controller any more. It is Bitcraze's, from
-// wallfollowing_multiranger_onboard.c -- the one published with McGuire et al.,
-// "Minimal navigation solution for a swarm of tiny flying robots to explore an
-// unknown environment", Science Robotics 4(35), 2019. It has been flown on real
-// swarms. We call it and fly what it says.
+// The follower is wallfollowing_corners.c: a script of discrete steps (CF_*
+// codes in wallfollowing_corners.h). It holds the wall distance by strafing
+// sideways with the nose along the wall, and yaws only in 90-degree turns on
+// the spot. Correcting distance by steering instead couples distance and
+// heading errors so that each grows the other; strafing keeps them independent,
+// and strafing needs velocity setpoints.
 //
-// WHY WE REPLACED OUR OWN, because this is the whole lesson of the project:
+// The follower decides at 10 Hz, in the main loop alongside the recorder and
+// the guards (all tuned for 10 Hz). Its setpoint is re-sent every 10 ms at the
+// foot of the loop, so the commander never flies a stale command.
 //
-//   Our controller could only STEER. To fix its distance from the wall it had
-//   to turn, and turning changes where it is going, so a small distance error
-//   became a heading error, which produced a LARGER distance error a moment
-//   later. The loop fed itself. Seven-second flights were fine because there
-//   was no time for it to build up. A fourteen-second flight crept in to 20cm
-//   and touched the wall. That is not a tuning problem, it is a controller
-//   that was never stable -- it just diverged slower than the flights were
-//   long.
-//
-//   Bitcraze's controller SLIDES SIDEWAYS to hold the distance while keeping
-//   the nose pointed along the wall. Distance and heading stay independent, so
-//   an error in one cannot grow the other.
-//
-// That difference is why this needs velocity setpoints and the old one did
-// not: strafing is something you can only ask for as a velocity.
-//
-// ONE DELIBERATE DEVIATION from the Bitcraze demo: their loop decides at
-// 100Hz. Ours decides at 10Hz, because this loop also carries the recording,
-// the battery guard and the obstacle guard, all of which are tuned for 10Hz
-// and none of which should be disturbed. The setpoint is still REFRESHED at
-// 100Hz (see the foot of the main loop), so the aircraft is never flying an
-// aging command. The correction is bang-bang at half of WF_SPEED_MS, so a
-// 10Hz decision overshoots by at most 1cm before it is reconsidered -- well
-// inside the 10cm deadband the controller works to.
+// Forward cruise speed handed to the follower, m/s.
 #define WF_SPEED_MS      0.2f
 
-// Ceiling on how fast the aircraft is allowed to rotate, degrees per second.
+// Ceiling on the commanded yaw rate, deg/s.
 //
-// WHY THIS EXISTS. Turning is where this aircraft kept failing: it tilted
-// through every corner, crashed at the turning point of a 45s flight, and
-// bumped the wall while pivoting at an inward corner. What makes that telling
-// is that a corner turn commands ZERO velocity -- commandTurn() sets cmdVelX to
-// 0 and the action clears cmdVelY, so nothing asks the aircraft to move at all.
-// Drifting anyway means the position estimate is wrong, not the controller.
+// Yawing over the Flow deck corrupts the position estimate: the optical-flow
+// sensor sees the floor sweep past and the estimator reads part of it as
+// translation, which the controller then turns into real drift. Near a wall
+// that drift is a collision, so turns are kept slow.
 //
-// That is the Flow deck. The optical flow sensor watches the floor sweep past
-// during a yaw, the estimator reads part of that sweep as real translation, and
-// the velocity controller then works hard to cancel a motion that was never
-// happening. The tilt it uses to do that becomes drift, and 40cm from a wall
-// drift is a collision.
-//
-// Bitcraze set maxTurnRate to 0.5 rad/s (about 29 deg/s) alongside a forward
-// speed of 0.5 m/s. We fly at 0.2 m/s -- 40% of their speed at 100% of their
-// turn rate. Halving the rotation roughly halves how fast the flow estimate is
-// corrupted, at the cost of a 46-degree corner taking about 3 seconds instead
-// of 1.6. That trade was unaffordable while flights were 15 seconds long and
-// corners never completed; with a 45s timer there is room for it.
-//
-// Capped here in our own layer rather than by editing Bitcraze's file, so their
-// state machine stays exactly as published. This is safe because every one of
-// its transitions is driven by a MEASURED heading change or a range reading,
-// never by assuming a turn took a particular time -- so a slower turn simply
-// takes more ticks to satisfy the same condition.
-// 20, raised from 15 after flying it. 15 stopped the aircraft tilting through
-// corners, which was the point, but it turned visibly slower than it needed to
-// and every corner manoeuvre spends that time inside the outbound budget. 20 is
-// still well under Bitcraze's 29 and keeps most of the margin.
+// The corners follower already turns slowly (30 deg/s in a corner turn, at
+// most 10 deg/s of heading hold while following), so this 45 deg/s cap does
+// not engage with it. It is a backstop applied outside the follower; see
+// wfTick().
 #define WF_MAX_YAWRATE_DEG  45.0f
 
-// How fast the commanded velocity may change, m/s^2. See the ramp in wfTick.
+// How fast the commanded velocity may change, m/s^2. Used by the ramps in
+// wfTick() and RETURN.
 #define WF_ACCEL_MS2        0.4f
 
-// The ramped command, carried between ticks. Reset between flights, or a
+// The ramped command, carried between ticks. Reset at each takeoff, or a
 // second flight on a warm drone begins at the speed the last one ended on.
 static float vx_cmd = 0.0f;
 static float vy_cmd = 0.0f;
 
-// Drop a breadcrumb every time the drone has moved this far since the last
-// one. The old controller dropped one per completed hop; there are no hops
-// any more, so distance is what marks the trail now.
-// Halved from 300mm. The return flies straight lines between breadcrumbs, so
-// the spacing IS the resolution of the path home: at 300mm a flight that
-// rounded a corner was retraced as a shortcut across it, which is the "it went
-// a direct route instead of the exact way" that was reported. At 150mm the
-// trail bends where the flight bent.
+// Drop a breadcrumb whenever the drone is this far (mm) from the previous one.
+// The return flies straight lines between crumbs, so this spacing is the
+// resolution of the path home; at 300 mm the return cut across corners the
+// outbound leg had flown round.
 #define WF_CRUMB_MM      150
 
-// True while velocity setpoints are driving the aircraft. It gates the 100Hz
-// refresh at the foot of the loop, and it is how the return leg knows it has
-// to hand control back to the high-level commander.
+// True while velocity setpoints are driving the aircraft. Gates the 100 Hz
+// refresh at the foot of the loop, and tells releaseToHighLevel() there is
+// control to hand back before landing.
 static bool vel_active = false;
 
 // The one setpoint struct, reused. Held at file scope because the 100Hz
 // refresh re-sends it without rebuilding it.
 static setpoint_t wf_setpoint;
 
-// Which state the follower is in, published so a crash log says what the
-// aircraft was doing rather than leaving us to guess again.
+// The follower's current step (CF_* code). tele_wfstate is its copy for the
+// recorder and the WF console line: 0 until the follower first runs in a
+// flight. It is not a tele.* param or log variable (see the param table).
 static int wf_state = CF_FOLLOW;
 static uint8_t tele_wfstate = 0;
 
 // Worst tilt since the last sample, 2-degree units. See FlightSample.tilt.
 static uint8_t tilt_peak = 0;
 
-// How many consecutive ticks the aircraft has been past OVER_TILT_DEG.
-//
-// A downloaded flight came back with 42 samples of which about four were
-// flying: the aircraft went over at the start, and the mission task then
-// recorded it lying on the floor for the rest of the timer -- the same frozen
-// position and the same range readings, over and over, burying the part anyone
-// wanted to look at.
-//
-// Past this angle it is not flying, it is lying down. The Crazyflie's own
-// supervisor has already cut the motors by then, so there is nothing left to
-// command and nothing left worth recording.
+// Consecutive ticks with roll or pitch beyond OVER_TILT_DEG. At that angle the
+// aircraft is down, not flying (the stock supervisor normally cuts the motors
+// first), so the flight is ended through the abort path rather than recording
+// a drone lying on the floor until the timer runs out.
 #define OVER_TILT_DEG    70.0f
 #define OVER_TILT_TICKS  10      // one second at 10Hz
 static uint8_t over_ticks = 0;
 
-// The sensors the follower reads. File scope because it runs outside the
-// block where appMain keeps its own log handles.
+// Copies of appMain's log handles, for the helpers outside it (wfTick,
+// clampAwayFromObstacles, commandedHeight, releaseToHighLevel).
 static logVarId_t wf_idFront, wf_idLeft, wf_idRight, wf_idYaw, wf_idBack, wf_idUp;
 
-// --- Refusing to fly into things --------------------------------------------
+// --- Obstacle clamp (clampAwayFromObstacles) --------------------------------
 //
-// Anything closer than this in the direction of travel cancels movement that
-// way. Nothing else: the commanded velocity is only ever reduced, never
-// redirected.
+// The last layer on the velocity command, in wall-mode OUTBOUND and in RETURN.
+// Within WF_STOP_MM it only removes motion toward an obstacle; within
+// WF_PUSH_MM it backs away. It never invents a manoeuvre of its own (no turns,
+// no handover), so it cannot oscillate against the follower or fight it for
+// control.
 //
-// That restraint is the entire point. Every crash in this project came from
-// logic that decided to DO something clever near a wall -- turn toward it,
-// stop dead, hand over control -- and a layer that can only subtract cannot
-// invent a manoeuvre, cannot oscillate against the follower, and cannot fight
-// it for control. It composes with whatever the follower wants instead of
-// arguing with it.
-//
-// 250mm sits below everything the follower works to: it keeps 400mm off the
-// wall and calls a corner at 600mm ahead. So in normal flight this never
-// engages at all. It is what catches the case the follower got wrong -- like
-// flying into a dead end because the corner never triggered.
-// Stop moving TOWARDS anything inside this, on any of the four sides.
+// 300 mm is below the follower's working distances with the defaults (400 mm
+// off the wall; a corner is called at walldist + 150 mm = 550 mm ahead), so in
+// normal following it stays out of the way. It catches what the follower gets
+// wrong, such as a corner that never triggered.
+// Stop moving towards anything inside this, on any of the four sides.
 #define WF_STOP_MM       300
 
-// And inside THIS, actively back away from it.
-//
-// The difference is the whole point, and it took a crash to see. Stopping is
-// not the same as retreating: an aircraft that has merely stopped commanding
-// motion toward a wall is still drifting toward it, on momentum and on an
-// estimator that is quietly wrong. It then sits at 250mm doing nothing while
-// the gap closes, which is exactly what was watched happening -- the front
-// reading creeping down with the aircraft taking no action until it was too
-// late.
-//
-// So below this the velocity is not zeroed, it is reversed. This runs on the
-// final command, after the follower has had its say, so it holds in EVERY step
-// -- including the three seconds of a corner turn, where nothing else looks at
-// the front at all.
-//
-// Gentle on purpose. It only has to out-run a drift of a few centimetres a
-// second, and shoving a quadrotor away from one wall is a good way to introduce
-// it to another.
+// Inside this, actively back away at WF_PUSH_MS instead of only stopping. A
+// drone that merely stops commanding motion toward a wall keeps drifting
+// toward it on momentum and estimator error. Applied to the final command, so
+// it holds in every follower step, including corner turns where nothing else
+// watches the front. Gentle on purpose: it only has to beat a slow drift, and
+// a hard shove away from one wall can put the drone into another.
 #define WF_PUSH_MM       200
 #define WF_PUSH_MS       0.12f
 
@@ -425,43 +341,33 @@ static int16_t crumb_x = 0, crumb_y = 0;
 // Tick at which the braking phase began, so the ramp knows how far along it is.
 static TickType_t brake_start = 0;
 
-// How many consecutive ticks every ranger has read nothing.
+// Consecutive in-flight ticks on which all six tele ranges read 0 ("no
+// reading"). One sensor reading 0 is open space, but all of them at once means
+// the ranging hardware has stopped answering (the Multi-ranger's I2C expander
+// has failed this way), and the follower would see open space everywhere and
+// fly on blind. In wall-mode OUTBOUND this ends the leg (tele.outwhy = 7).
 //
-// A dead Multi-ranger reads 0 on all six, and 0 means "no reading", which every
-// other test in this file correctly treats as open space. That is right for one
-// sensor and catastrophic for all six at once: the follower sees the wall gone,
-// enters the wall-ended branch, and drives forward at cruise speed with the
-// front also reading clear -- a blind aircraft accelerating across a room.
-//
-// The giveaway is DOWN. There is always a floor. A down reading of zero while
-// flying is not open space, it is a deck that has stopped answering, which this
-// one has done before: the I2C expander stops acknowledging and every sensor
-// fails its init.
+// The down range is part of the test because there is always a floor. Note
+// that it comes from the Flow deck (range.zrange), not the Multi-ranger, so a
+// failed Multi-ranger with a working Flow deck does not by itself trip this.
 static uint8_t deck_silent_ticks = 0;
 #define DECK_SILENT_LIMIT 10   // one second at 10Hz
 
-// The forward speed the brake ramps down FROM.
-//
-// This only became necessary when the velocity ramp went in. Before it, the
-// aircraft was always flying at exactly WF_SPEED_MS when the brake began, so
-// ramping from that constant was right. With a ramp it is not: the commanded
-// speed is whatever vx_cmd has reached, and the follower may well be stopped
-// mid-corner when the timer fires. Ramping "down" from WF_SPEED_MS then
-// commands a forward LURCH from nearly nothing up to full speed, at the exact
-// moment the aircraft is being handed to the trajectory planner.
+// The forward speed the brake ramps down from: vx_cmd at the moment the
+// outbound leg ends, which can be well below WF_SPEED_MS (for example when
+// stopped mid-corner). Ramping from WF_SPEED_MS instead would command a
+// forward lurch.
 static float brake_v0 = 0.0f;
 
-// The heading the RETURN leg is holding, in radians. Bookkeeping for
-// the landing, which turns back to it. 0 = the way the drone faced at takeoff.
-// The return holds this heading rather than steering to it.
+// Heading recorded when BRAKE ends and again in releaseToHighLevel(), radians
+// (0 = the heading at takeoff). For reference only; nothing reads it. RETURN
+// holds its heading by commanding a yaw rate of 0.
 static float mission_yaw = 0.0f;
 
-// The heading the drone ACTUALLY has, in radians, read from the estimator.
-//
-// This is what gets recorded, not mission_yaw. Under the wall follower the
-// heading is commanded as a RATE, so there is no commanded angle to record --
-// and a measured heading is the better thing to draw the map from anyway,
-// because it is what the aircraft really did.
+// Measured heading (stabilizer.yaw) in radians, updated every tick. Recorded
+// in each sample and used by RETURN to turn world-frame directions into the
+// body frame. Under the follower the heading is commanded as a rate, so there
+// is no commanded angle to record.
 static float meas_yaw = 0.0f;
 
 // Keep an angle between -180 and +180 degrees (in radians), so turning the
@@ -472,49 +378,32 @@ static float wrapYaw(float y) {
   return y;
 }
 
-// SAFETY: if a hop hasn't finished this long after it should have, move on
-// anyway. Stops one stuck hop from leaving the drone hanging in the air.
-
-
 // --- Breadcrumbs --------------------------------------------------------------
 //
-// The trail home. One saved position every WF_CRUMB_MM of travel.
+// The trail home: x, y and the commanded height (mm) every WF_CRUMB_MM of
+// outbound travel, crumb 0 at the start of the leg. RETURN uses only x and y;
+// its height comes from commandedHeight() at the time, so the stored z is
+// currently unused.
 //
-// The height is stored with each one, not assumed. The outbound leg ducks under
-// a low ceiling, so a return flown at the requested altitude would climb back
-// into the roof it had just avoided. Retracing the height that was actually
-// flown is the only version of "go back the way you came" that is true in a
-// cave.
-//
-// Doubled to 128 when the spacing was halved, so the reachable range is
-// unchanged at about 19m of outbound path -- far more than any timer the app
-// offers can fly at 0.2 m/s. Costs 768 bytes of static RAM, not heap.
+// 128 crumbs at 150 mm or more apart cover at least 19 m of outbound path
+// (96 s at 0.2 m/s); a full trail ends the leg (tele.outwhy = 4). 768 bytes of
+// static RAM.
 #define MAX_WAYPOINTS 128
 typedef struct { int16_t x, y, z; } Waypoint;
 static Waypoint waypoints[MAX_WAYPOINTS];
 static uint16_t waypoint_count = 0;
 
-// --- Mission phase (the app can read this) ----------------------------------
+// --- Mission phase (tele.phase) ---------------------------------------------
 #define PHASE_IDLE      0
 #define PHASE_CLIMB     1
 #define PHASE_OUTBOUND  2
 #define PHASE_RETURN    3
 #define PHASE_LANDING   4
-// Slowing down, between following the wall and flying home.
-//
-// This phase exists because its absence crashed the aircraft. The outbound leg
-// ended by stepping the commanded velocity straight from full speed to zero,
-// and stopping a quadrotor means pitching up, which trades away the vertical
-// component of its thrust. With the pack sagging to 3219mV there was no
-// headroom left to brake and hold height at the same time, so it sank -- about
-// 20cm on a good day, and on a bad one the attitude went with it and the
-// aircraft ended on its back. The log is unambiguous: seven healthy lines at
-// st=4 holding 400mm, then "returning", then 65 degrees of roll.
-//
-// So the speed is ramped down over BRAKE_MS instead, as a phase rather than a
-// blocking wait -- the old code slept 400ms inside the loop, which also blinded
-// the recording and the tilt watch for exactly the window where the failure
-// began.
+// Wall mode only, between OUTBOUND and RETURN: ramp the forward speed to zero
+// over BRAKE_MS. A quadrotor stops by pitching, which costs vertical thrust;
+// an instant stop on a sagging pack loses height and has rolled the aircraft
+// over. It is a phase rather than a blocking wait, so the recorder and the
+// tilt watch keep running through it.
 #define PHASE_BRAKE     5
 
 // How long to spend slowing down. Long enough that the aircraft never has to
@@ -522,42 +411,34 @@ static uint16_t waypoint_count = 0;
 #define BRAKE_MS        800
 static uint8_t tele_phase = PHASE_IDLE;
 
-// Why the drone stopped going out and turned home (the app can read this):
-//   0 = still going  1 = half the timer  2 = geofence
-//   3 = blocked      4 = out of breadcrumbs
+// Why the outbound leg ended (tele.outwhy):
+//   0 = still going    1 = timer (half the timer in wall mode, the full hover
+//   time in hover mode)    2 = geofence    4 = breadcrumb trail full
+//   7 = ranger deck silent
+// 3 ("blocked") is not set by this build.
 static uint8_t tele_outwhy = 0;
 
-// Current heading in whole degrees, for the app.
+// Measured heading in whole degrees, for the app.
 static int16_t tele_yaw = 0;
 
-// The hop currently in progress, if any, and its time limits.
+// Tick at which the outbound leg ends, and the breadcrumb RETURN is flying to.
 static TickType_t outbound_deadline = 0;
 static uint16_t   return_index = 0;
 
-// Straight-line distance from the origin, for the geofence. Compares squared
-// distances so there is no square root in the flight loop.
+// Straight-line distance from the origin (the takeoff point, after the
+// estimator reset), for the geofence. Compares squared distances so there is
+// no square root in the flight loop.
 static bool beyondGeofence(void) {
-  // 64-bit on purpose. tele_x and tele_y are millimetres in an int16, so each
-  // square reaches 1.07e9 and the SUM can pass INT32_MAX. That needs a
-  // diverged estimator to happen -- and a diverged estimator is exactly when
-  // this check has to work, since it is the last thing standing between a
-  // confused drone and the far end of the room. This one has already reported
-  // a 6401mm altitude in a 500mm hover, so it is not a hypothetical.
+  // 64-bit on purpose: tele_x and tele_y are int16 mm, so each square reaches
+  // 1.07e9 and the sum can exceed INT32_MAX. That takes a diverged estimate
+  // (6401 mm has been reported in a 500 mm hover), which is exactly when the
+  // geofence has to work.
   int64_t x = tele_x, y = tele_y;
   return (x * x + y * y) > ((int64_t)GEOFENCE_MM * (int64_t)GEOFENCE_MM);
 }
 
-// Issue one absolute goTo and arm the timeout that covers it.
-//
-// Absolute rather than relative on purpose. A relative goTo is relative to the
-// commander's own setpoint, which is not necessarily where the drone actually
-// is; over dozens of steps that difference accumulates and the breadcrumb
-// trail stops matching the flight. Every target here is computed from the
-// estimated position and sent in world coordinates.
-
-// True once the current step is done, or has taken so long that waiting
-// further is worse than moving on.
-
+// Append the current position to the trail (if there is room) and make it
+// the reference point for the next drop.
 static void dropBreadcrumb(void) {
   if (waypoint_count < MAX_WAYPOINTS) {
     waypoints[waypoint_count].x = tele_x;
@@ -570,20 +451,18 @@ static void dropBreadcrumb(void) {
   crumb_y = tele_y;
 }
 
-// --- Flying on velocity, for the wall follower ------------------------------
+// --- Flying on velocity (wall-mode OUTBOUND, BRAKE, RETURN) -----------------
 //
-// Height stays an ABSOLUTE setpoint while x, y and yaw are velocities. That
-// mixture is what lets the follower strafe and rotate without ever having an
-// opinion about altitude, which the barometer and the down ranger hold on
-// their own. Copied from Bitcraze's own demo, deliberately unchanged.
+// Height is an absolute setpoint while x, y and yaw are velocities, so the
+// follower can strafe and rotate without commanding altitude.
 //
-// velocity_body = true means vx is "forward" and vy is "left" as the DRONE is
-// pointing, not as the room is laid out. The follower thinks entirely in its
-// own frame, so anything else would need a rotation here and would be one more
-// place to get a sign wrong.
+// velocity_body = true means vx is forward and vy is left as the drone is
+// pointing, not as the room is laid out. The follower works in its own frame,
+// so no rotation is needed here.
 //
-// Priority 3 beats the high-level commander's 1, so the first of these calls
-// takes the aircraft off the trajectory planner automatically.
+// Priority 3 outranks the high-level commander, so the first of these calls
+// takes the aircraft off the trajectory planner; releaseToHighLevel() gives it
+// back.
 static void sendBodyVelocity(float vx, float vy, float z_m, float yawRateDeg) {
   memset(&wf_setpoint, 0, sizeof(wf_setpoint));
   wf_setpoint.mode.z   = modeAbs;       wf_setpoint.position.z = z_m;
@@ -594,39 +473,27 @@ static void sendBodyVelocity(float vx, float vy, float z_m, float yawRateDeg) {
   commanderSetSetpoint(&wf_setpoint, 3);
 }
 
-// Run the follower once and fly what it says.
-//
-// The ranges handed over are the RAW log values in metres, NOT tele_front and
-// friends. That is not a shortcut, it is required: clampRange() turns anything
-// out of range into 0, and this controller reads 0 as "the wall is touching my
-// nose" and turns immediately. The driver reports 32767mm for nothing-in-range,
-// which divided by 1000 is 32.7 metres -- exactly the "no wall anywhere" the
-// controller expects, and what Bitcraze's own demo feeds it.
-//
-// direction is +1 with the wall on the RIGHT and -1 with it on the LEFT, which
-// is the pairing Bitcraze's demo uses with the matching sensor.
-// Cancel any commanded motion that heads into something close.
+// Cancel any commanded motion that heads into something close, and back away
+// from anything very close. See WF_STOP_MM and WF_PUSH_MM.
 //
 // Body frame: vx forward, vy LEFT. So a positive vy is checked against the
 // left sensor and a negative one against the right.
 //
-// Only motion TOWARD an obstacle is removed. Motion away is untouched, which
-// matters more than it sounds: when the follower is hard against its wall it
-// answers by strafing away from it, and a clamp that blocked that would trap
-// the aircraft against the very thing it was trying to escape.
+// Only motion toward an obstacle is removed; motion away is untouched. When
+// the follower is hard against its wall it strafes away from it, and a clamp
+// that blocked that would trap the aircraft against the wall.
 //
-// A reading of exactly 0 is treated as "no reading" rather than "touching".
-// The raw sensors report 32767 when nothing is in range, so a real 0 is
-// almost unheard of -- but safeLogFloat() also returns 0 for a sensor that is
-// not fitted, and reading that as an obstacle would freeze a Multi-ranger-less
-// aircraft in place. Losing the 0mm case is the cheaper mistake by far.
+// Reads the raw log ranges in mm. The driver reports 32767 for nothing in
+// range, so a real 0 is almost unheard of; but safeLogFloat() returns 0 for a
+// sensor that is not fitted, and treating that as an obstacle would freeze a
+// Multi-ranger-less aircraft in place. So 0 counts as no reading.
 static void clampAwayFromObstacles(float *vx, float *vy) {
   float f = safeLogFloat(wf_idFront);
   float b = safeLogFloat(wf_idBack);
   float l = safeLogFloat(wf_idLeft);
   float r = safeLogFloat(wf_idRight);
 
-  // 0 means the laser saw nothing, which at these ranges means far away.
+  // 0 = no reading (see above), not an obstacle.
   bool fNear = f > 0.0f && f < (float)WF_STOP_MM;
   bool bNear = b > 0.0f && b < (float)WF_STOP_MM;
   bool lNear = l > 0.0f && l < (float)WF_STOP_MM;
@@ -640,10 +507,9 @@ static void clampAwayFromObstacles(float *vx, float *vy) {
 
   // Then: if something is closer still, back away from it. See WF_PUSH_MM.
   //
-  // The opposite side is checked before pushing, because in a gap narrower than
-  // two push distances both sides are close at once and backing away from one
-  // means flying into the other. Pinned between two walls, holding still is the
-  // only honest answer -- and the mission timer will take it home from there.
+  // The opposite side is checked before pushing: in a gap narrower than two
+  // push distances both sides are close at once, and backing away from one
+  // means flying into the other. Pinned on both sides, that axis holds still.
   bool fPush = f > 0.0f && f < (float)WF_PUSH_MM;
   bool bPush = b > 0.0f && b < (float)WF_PUSH_MM;
   bool lPush = l > 0.0f && l < (float)WF_PUSH_MM;
@@ -657,27 +523,17 @@ static void clampAwayFromObstacles(float *vx, float *vy) {
   else if (rPush && !lPush) *vy =  WF_PUSH_MS;
   else if (lPush && rPush)  *vy =  0.0f;
 
-  // AND SLOW DOWN WHILE DOING IT.
-  //
-  // Easing sideways at 120mm/s while still flying forward at 200 is a 31 degree
-  // crab, and a recorded flight arrived at a corner doing exactly that: weaving
-  // off the wall from 180mm back out to 380 and meeting the corner diagonally
-  // at full speed. It lost it within a second of the front going blocked.
-  //
-  // Something inside 200mm is a reason to be careful, not only a reason to move
-  // over. Halving the forward speed while a push is active cuts the crab angle,
-  // buys time for the gap to open before the next decision, and shortens every
-  // stopping distance that follows.
+  // And halve forward speed while a side push is active. Easing sideways at
+  // 0.12 m/s while flying forward at 0.2 m/s is a 31-degree crab, which can
+  // carry the drone diagonally into a corner at full speed. Slower forward
+  // flight cuts the crab angle and shortens the stopping distances that follow.
   if ((lPush || rPush) && *vx > 0.0f) *vx *= 0.5f;
 }
 
-// How high to fly right now, in metres.
-//
-// Normally the height the app asked for. Under a low ceiling, less: a cave
-// roof does not care what altitude was requested on the pad. Taken from
-// Bitcraze's own wall-following demo, which does exactly this with the up
-// ranger, and capped so that one bad reading cannot drive the aircraft into
-// the floor.
+// How high to fly right now, in metres: mission.height, lowered by
+// (WF_CEIL_MM - up) when the up ranger reads under WF_CEIL_MM. The drop is
+// capped at WF_CEIL_DROP_MM so one bad reading cannot drive the aircraft into
+// the floor. Used for every velocity setpoint.
 static float commandedHeight(void) {
   float h = mission_height / 1000.0f;
   float up = safeLogFloat(wf_idUp);
@@ -691,6 +547,13 @@ static float commandedHeight(void) {
   return h;
 }
 
+// One follower tick (10 Hz, wall-mode OUTBOUND only): run the corners follower,
+// cap the yaw rate, clamp against obstacles, ramp, and send the setpoint.
+//
+// The follower gets the raw log ranges in metres, not tele_*: the driver's
+// 32767 mm for nothing in range arrives as 32.7 m, which the follower treats as
+// open space (it also treats 0 or less as open). direction is +1 with the wall
+// on the right and -1 with it on the left.
 static void wfTick(void) {
   float frontRange = safeLogFloat(wf_idFront) / 1000.0f;
   float sideRange  = (mission_wallfollow == 2 ? safeLogFloat(wf_idLeft)
@@ -707,24 +570,10 @@ static void wfTick(void) {
                                  frontRange, sideRange, yawRad, direction, now_s);
   tele_wfstate = (uint8_t)wf_state;
 
-  // Cap the rotation -- and slow the TRANSLATION by the same factor.
-  //
-  // See WF_MAX_YAWRATE_DEG for why turning slowly matters here. But capping the
-  // turn ALONE is wrong, because around an outside corner the follower does not
-  // choose a turn rate independently: it derives one from the forward speed in
-  // order to fly a particular arc.
-  //
-  //     vel_w = direction * (-vel_x / radius)
-  //
-  // The radius is the wall distance, so the aircraft curves around the corner
-  // at the range it was already holding. Capping the yaw rate and leaving the
-  // speed alone changes that radius -- 0.2 m/s against a 20 deg/s cap arcs at
-  // 0.57m instead of the 0.4m intended, so it runs wide and stops tracking the
-  // wall it is turning around. Scaling both keeps the ratio, and therefore the
-  // arc, exactly as written. The corner is flown on the same path, just slower.
-  //
-  // States that rotate on the spot have vel_x = 0 already, so this costs them
-  // nothing at all.
+  // Cap the rotation, and slow the translation by the same factor so that any
+  // arc (a turn rate paired with forward speed) keeps its radius instead of
+  // running wide. See WF_MAX_YAWRATE_DEG; with the corners follower (30 deg/s
+  // at most, and on the spot) the cap does not engage.
   float yawRateDeg = yawRateRad * RAD2DEG;
   float yawMag = yawRateDeg < 0.0f ? -yawRateDeg : yawRateDeg;
   if (yawMag > WF_MAX_YAWRATE_DEG) {
@@ -735,18 +584,15 @@ static void wfTick(void) {
   }
 
   // Last word before the setpoint goes out: never fly into anything.
-  // Applied to the TARGET, so the ramp below decelerates into the stop rather
+  // Applied to the target, so the ramp below decelerates into the stop rather
   // than snapping to it.
   clampAwayFromObstacles(&vx, &vy);
 
-  // Ease onto the new speed rather than stepping onto it.
-  //
-  // Without this the aircraft is commanded straight from one velocity to the
-  // next, and the controller answers a step change by pitching hard -- the dip
-  // that shows on every direction change. The script depends on it too: CF_STOP
-  // asks for a halt and waits CF_STOP_S for it, which is only a smooth
-  // deceleration if something limits the rate of change. 0.4 m/s^2 takes the
-  // cruise speed to zero in half a second, comfortably inside that wait.
+  // Ease onto the new speed rather than stepping onto it. The controller
+  // answers a step change in velocity by pitching hard, which shows as a dip
+  // in height. The follower relies on this too: CF_STOP commands zero and waits
+  // CF_STOP_S (0.7 s); 0.4 m/s^2 takes the cruise speed to zero in 0.5 s,
+  // inside that wait.
   float maxStep = WF_ACCEL_MS2 * 0.1f;     // decisions run at 10Hz
   float dvx = vx - vx_cmd;
   float dvy = vy - vy_cmd;
@@ -762,34 +608,35 @@ static void wfTick(void) {
 
 // Give the aircraft back to the high-level commander.
 //
-// MUST be called before any goTo or land that follows wall following, and this
-// is the one piece of the port that is a safety matter rather than a behaviour
-// one. Velocity setpoints are sent at priority 3 and the high-level commander
-// sits at 1, so while the 100Hz refresh is running a land command is accepted
-// and then immediately overridden -- the drone would simply keep flying.
-// Clearing vel_active stops the refresh; commanderRelaxPriority() then tells
-// the planner the live state estimate and lowers the priority so its own
-// setpoints take effect again.
+// SAFETY: must run before any land command that follows velocity flight.
+// Velocity setpoints go out at priority 3, above the high-level commander, so
+// while the 100 Hz refresh runs a land command is accepted and then overridden
+// and the drone keeps flying. Clearing vel_active stops the refresh;
+// commanderRelaxPriority() then hands the planner the live state estimate and
+// lowers the priority so its setpoints take effect again. No-op in hover mode.
 static void releaseToHighLevel(void) {
   if (!vel_active) return;
   vel_active = false;
   // One last command to hold still, so the aircraft is stopped by an
-  // instruction rather than by a supervisor that has given up on us: a setpoint
-  // older than 500ms trips supervisorStateWarningLevelOut, which disables x and
-  // y control and forces the aircraft level.
+  // instruction rather than by the supervisor: a setpoint older than 500 ms
+  // trips supervisorStateWarningLevelOut, which disables x and y control and
+  // forces the aircraft level.
   //
-  // There is no wait here any more. PHASE_BRAKE has already ramped the speed
-  // down over BRAKE_MS before this is called, so by now the aircraft is
-  // stationary. The 400ms blocking wait this replaces was doing real harm: it
-  // stopped the loop, so the recording and the tilt watch went blind for
-  // exactly the window in which the aircraft started falling.
+  // No blocking wait here, so the recorder and the tilt watch never go blind.
+  // The drone may still be moving (RETURN flies right up to crumb 0, and an
+  // abort or the hard time limit can come at any point), so this zero
+  // setpoint is the stop.
   sendBodyVelocity(0.0f, 0.0f, commandedHeight(), 0.0f);
   commanderRelaxPriority();
-  // Whatever heading it ended up on becomes the heading to hold from here.
+  // Final heading, for reference (see mission_yaw).
   mission_yaw = wrapYaw(safeLogFloat(wf_idYaw) * DEG2RAD);
 }
 
 // --- Download protocol, CRTP port 14 --------------------------------------
+// App -> drone, channel 0: 0x01 = send the recording, 0x02 = clear it.
+// Drone -> app: one packet per sample on channel 1, [idx_lo, idx_hi,
+// FlightSample], then [0xFF, count_lo, count_hi] on channel 0. A stalled send
+// ends the transfer without the EOF packet.
 #define CRTP_PORT_BULK  14
 #define BULK_CHAN_CTRL  0
 #define BULK_CHAN_DATA  1
@@ -801,7 +648,7 @@ static bool dump_requested  = false;
 static bool clear_requested = false;
 
 // Runs in CRTP task context, so it only raises a flag. The transfer itself
-// happens in the main loop, where blocking is safe.
+// runs in the main loop.
 static void bulkCrtpCb(CRTPPacket *pk) {
   if (pk->channel == BULK_CHAN_CTRL && pk->size >= 1) {
     if (pk->data[0] == CMD_DUMP_START) dump_requested = true;
@@ -809,16 +656,12 @@ static void bulkCrtpCb(CRTPPacket *pk) {
   }
 }
 
-// One sample per packet, index included so the app can tell a dropped packet
-// from a shifted one rather than silently mis-aligning every later sample.
-// Sends one packet without ever blocking indefinitely.
+// Send one packet, retrying up to 20 times 5 ms apart, then give up.
 //
-// crtpSendPacketBlock() waits forever for queue space. If the link is
-// congested or has dropped, that hangs this task permanently -- and this task
-// is the one running the mission and updating telemetry, so the whole drone
-// goes silent and unreachable until it is power cycled. Retry a bounded number
-// of times instead and give up, because a failed download is recoverable and a
-// hung flight controller is not.
+// crtpSendPacketBlock() waits forever for queue space. On a congested or
+// dropped link that would hang this task, which also runs the mission and the
+// telemetry, until a power cycle. A failed download is recoverable; a hung
+// flight task is not.
 static bool sendPacketBounded(CRTPPacket *pk) {
   for (int attempt = 0; attempt < 20; attempt++) {
     if (crtpSendPacket(pk)) return true;
@@ -827,6 +670,9 @@ static bool sendPacketBounded(CRTPPacket *pk) {
   return false;
 }
 
+// Send the recording, one sample per packet. The index is included so the app
+// can tell a dropped packet from a shifted one rather than mis-aligning every
+// later sample. Blocks this loop for at least 5 ms per sample.
 static void sendRecording(void) {
   DEBUG_PRINT("CAVEBAT: sending %d samples\n", (int)sample_count);
 
@@ -863,6 +709,8 @@ static void sendRecording(void) {
   DEBUG_PRINT("CAVEBAT: send complete\n");
 }
 
+// Log range in mm -> tele_* value. 0 means no reading: <= 0, or beyond 3000 mm
+// (which includes the driver's 32767 for nothing in range).
 static uint16_t clampRange(float mm) {
   if (mm <= 0.0f || mm > 3000.0f) return 0;
   return (uint16_t)mm;
@@ -882,16 +730,14 @@ void appMain(void) {
   logVarId_t idY     = logGetVarId("stateEstimate", "y");
   logVarId_t idZ     = logGetVarId("stateEstimate", "z");
   logVarId_t idYaw   = logGetVarId("stabilizer", "yaw");
-  // Tilt, for the crash trace. The aircraft has been flipping rather than
-  // colliding, and these two numbers are what tell those apart: a controller
-  // winding up against a bad estimate tilts further over several seconds,
-  // while something mechanical or an estimator jump goes from level to over
-  // inside one or two lines.
+  // Roll and pitch: for the over-tilt abort, the tilt peak in each sample and
+  // the TILT console line.
   logVarId_t idRoll  = logGetVarId("stabilizer", "roll");
   logVarId_t idPitch = logGetVarId("stabilizer", "pitch");
 
-  // The same handles again at file scope, for the wall follower. It runs from
-  // the 100Hz refresh at the foot of the loop, outside this function's scope.
+  // The same handles at file scope, for the helpers called from the 10 Hz
+  // state machine (wfTick, the obstacle clamp, commandedHeight,
+  // releaseToHighLevel).
   wf_idFront = idFront;
   wf_idLeft  = idLeft;
   wf_idRight = idRight;
@@ -905,11 +751,11 @@ void appMain(void) {
   uint32_t hover_deadline = 0;  // tick at which a hovering flight should land
   uint8_t  obstacle_streak = 0; // consecutive cycles seeing an obstacle
   uint8_t  lowbat_streak = 0;   // consecutive cycles seeing a collapsed battery
-  // Tick at which the climb finishes. Obstacle checking is suppressed until
-  // then: while climbing, the drone tilts and the side-facing rangers catch
-  // the floor, producing readings well under the limit with nothing actually
-  // in the way. Measured in flight: sides flicked between 32766 ("nothing")
-  // and ~450mm during a climb that was steady at 400-800mm at rest.
+  // Tick at which the climb finishes: CLIMB ends here, and the in-flight
+  // battery and obstacle aborts are suppressed until then. While climbing the
+  // drone tilts and the side rangers catch the floor (sides have been seen
+  // flicking between 32766 and ~450 mm with nothing in the way), and spin-up
+  // battery sag is at its worst.
   uint32_t climb_done_tick = 0;
   bool is_flying = false;
   uint32_t last_sample_tick = 0;
@@ -923,6 +769,7 @@ void appMain(void) {
     tele_alive++;
     tele_vbat  = (uint16_t)(safeLogFloat(idVbat) * 1000.0f);
     tele_canfly = (tele_vbat >= mission_minvbat) ? 1 : 0;
+    // Uses the previous tick's ranges (refreshed just below), a one-tick lag.
     tele_clear = (sideBlocked(tele_front) || sideBlocked(tele_back) ||
                   sideBlocked(tele_left)  || sideBlocked(tele_right)) ? 0 : 1;
     tele_front = clampRange(safeLogFloat(idFront));
@@ -931,43 +778,30 @@ void appMain(void) {
     tele_right = clampRange(safeLogFloat(idRight));
     tele_up    = clampRange(safeLogFloat(idUp));
     tele_down  = clampRange(safeLogFloat(idDown));
-    // The heading the aircraft really has. Recorded, and used to draw the map.
+    // The heading the aircraft really has: recorded, and used by RETURN.
     meas_yaw   = safeLogFloat(idYaw) * DEG2RAD;
     tele_yaw   = (int16_t)(meas_yaw * RAD2DEG);
     tele_x     = (int16_t)(safeLogFloat(idX) * 1000.0f);
     tele_y     = (int16_t)(safeLogFloat(idY) * 1000.0f);
     tele_z     = (int16_t)(safeLogFloat(idZ) * 1000.0f);
 
-    // --- The tilt watch -----------------------------------------------------
+    // --- Tilt and deck watch (while flying, every mode) ----------------------
     //
-    // The aircraft has been FLIPPING, not colliding, and no log has ever caught
-    // it happening. This is the one line that can settle why.
-    //
-    // It prints at the full 10Hz, but ONLY past 15 degrees, which a healthy
-    // flight never reaches -- so it costs nothing until something is going
-    // wrong and then it is dense exactly when it matters. A line this short at
-    // 10Hz is affordable on a 20-byte link; the full WF line at that rate would
-    // not be, which is how earlier evidence was lost.
-    //
-    // WHAT THE ANSWER LOOKS LIKE, either way:
-    //   tilt climbing over several lines  -> the controller is winding up
-    //                                        against an estimate it cannot
-    //                                        trust, and the fix is in software
-    //   level, then over inside one line  -> nothing was chasing anything. A
-    //                                        motor, a prop or a sudden
-    //                                        estimator jump, and no amount of
-    //                                        controller work will help
-    //
-    // Deliberately not restricted to wall following: hover flipped earlier in
-    // this project too, and a flight already lost is not one whose console
-    // traffic needs protecting.
+    // Over-tilt abort, deck-silent counter, tilt peak for the recorder, and a
+    // TILT console line at the full 10 Hz whenever roll or pitch exceeds 15
+    // degrees. A healthy flight stays under 15, so the line costs nothing on
+    // the 20-byte BLE link until something goes wrong. Reading it: tilt
+    // climbing over several lines means the controller is winding up against
+    // a bad estimate; level, then over within one line, points to a motor, a
+    // prop or a sudden estimator jump.
     if (is_flying) {
       float roll_now  = safeLogFloat(idRoll);
       float pitch_now = safeLogFloat(idPitch);
       if (roll_now < 0) roll_now = -roll_now;
       if (pitch_now < 0) pitch_now = -pitch_now;
-      // On its back? See over_ticks. Ends the flight rather than recording
-      // the floor until the timer runs out.
+      // Over on its side or back? See over_ticks. Fires once, when the count
+      // reaches OVER_TILT_TICKS with mission.state = 1; the abort branch of
+      // the state machine below then runs in this same tick.
       if (roll_now > OVER_TILT_DEG || pitch_now > OVER_TILT_DEG) {
         if (over_ticks < 255) over_ticks++;
       } else {
@@ -979,7 +813,7 @@ void appMain(void) {
         mission_state = 2;   // the ordinary abort path: stop, tidy up, idle
       }
 
-      // Has the ranger deck stopped answering? See deck_silent_ticks.
+      // Have all six ranges gone silent? See deck_silent_ticks.
       if (tele_front == 0 && tele_back == 0 && tele_left == 0 &&
           tele_right == 0 && tele_up == 0 && tele_down == 0) {
         if (deck_silent_ticks < 255) deck_silent_ticks++;
@@ -1002,8 +836,9 @@ void appMain(void) {
       }
     }
 
-    // Download requests. Safe at any time: this only reads the buffer, and the
-    // app is only ever connected while the drone is on the ground.
+    // Clear and dump requests, flagged by bulkCrtpCb(). A dump only reads the
+    // buffer, but it blocks this loop (at least 5 ms per sample), so it is
+    // meant for the ground; nothing here refuses it in flight.
     if (clear_requested) {
       clear_requested = false;
       sample_count = 0;
@@ -1015,9 +850,8 @@ void appMain(void) {
       sendRecording();
     }
 
-    // One sample per second while airborne. Driven off is_flying rather than a
-    // phase machine, because there is no phase machine here -- that is the
-    // point of this version.
+    // One sample per second while is_flying, taken before the state machine
+    // runs this tick. Nothing is recorded during the blocking land wait.
     if (is_flying && (xTaskGetTickCount() - last_sample_tick) >= M2T(1000)) {
       last_sample_tick = xTaskGetTickCount();
       if (sample_count < MAX_SAMPLES) {
@@ -1049,69 +883,52 @@ void appMain(void) {
         mission_state = 0; // clear the request so the app sees it rejected
 
     } else if (mission_guards && mission_state == 1 && !is_flying && !tele_clear) {
-        // Something is already inside the clearance limit. Taking off here just
-        // trips the in-flight abort ~100ms later, so the drone hops a few
-        // centimetres and lands -- which looks like a broken controller rather
-        // than an obstacle. Refuse up front and say so.
+        // Something is already inside minobst. Taking off would trip the
+        // in-flight obstacle abort as soon as the climb ends, which looks like
+        // a broken controller rather than an obstacle. Refuse up front and say
+        // so.
         DEBUG_PRINT("CAVEBAT: Takeoff REFUSED, obstacle within %d mm (f=%d b=%d l=%d r=%d)\n",
                     (int)mission_minobst, (int)tele_front, (int)tele_back,
                     (int)tele_left, (int)tele_right);
         mission_state = 0;
 
     } else if (mission_state == 1 && !is_flying) {
-        // App requested Takeoff
+        // Takeoff requested, and guards off or both pre-flight checks passed.
         DEBUG_PRINT("CAVEBAT: Initiating Takeoff to %d mm, battery %d mV\n",
                     (int)mission_height, (int)tele_vbat);
 
-        // Reset the position estimator and let it settle BEFORE lifting off.
+        // Reset the Kalman estimator and let it settle before lifting off.
+        // tele.phase stays IDLE during this.
         //
-        // This is why takeoff was a coin flip. Roughly half of flights flipped
-        // within two seconds of leaving the ground -- and the giveaway was the
-        // down-facing sensor reading 2413mm while the up-facing one read
-        // nothing: the drone was inverted, looking at the ceiling. That flight
-        // then reported climbing to 6401mm of a requested 500mm.
-        //
-        // It was NOT the battery. The crashed flight sagged 497mV and the good
-        // one straight after it sagged 592mV, both from a full charge. Nor the
-        // floor: every flight is flown over the same towel.
-        //
-        // The drone sits on the ground for tens of seconds between boot and
-        // launch and the Kalman filter accumulates drift the whole time -- the
-        // boot log prints "ESTKALMAN: State out of bounds, resetting" before it
-        // has been asked to do anything at all. Taking off on that stale
-        // estimate means the controller's first act can be a violent correction
-        // toward a position the drone was never in. Sometimes the estimate
-        // happens to be good and it flies. That is the coin flip.
-        //
-        // Every one of Bitcraze's own autonomous examples resets the estimator
-        // and waits before flying. This firmware never did.
+        // The estimate drifts while the drone sits on the pad between boot and
+        // launch. Taking off on a stale estimate makes the controller's first
+        // act a violent correction toward a position the drone is not at,
+        // which has flipped the aircraft within seconds of leaving the ground.
+        // Bitcraze's autonomous examples reset and wait the same way.
         {
           paramVarId_t resetId = paramGetVarId("kalman", "resetEstimation");
           if (PARAM_VARID_IS_VALID(resetId)) {
             paramSetInt(resetId, 1);
             vTaskDelay(M2T(100));
             paramSetInt(resetId, 0);
-            // Convergence takes about a second with a Flow deck. Two is the
-            // figure Bitcraze use, and it costs nothing but a pause on the pad.
-            // Telemetry freezes for this long because this task is the one that
-            // updates it. That is expected, not a stall.
+            // Convergence takes about a second with a Flow deck; 2 s is the
+            // figure Bitcraze use. Telemetry freezes for this long because
+            // this task is the one that updates it. Expected, not a stall.
             vTaskDelay(M2T(2000));
             DEBUG_PRINT("CAVEBAT: estimator reset, settled\n");
           } else {
-            // Fly anyway. A missing parameter is a reason to warn, not to ground
-            // the aircraft -- unreset is exactly how it behaved until now.
+            // Fly anyway: a missing parameter is a reason to warn, not to
+            // ground the aircraft.
             DEBUG_PRINT("CAVEBAT: kalman.resetEstimation NOT FOUND, flying unreset\n");
           }
         }
 
-        // Started after the settle, so the recording clock and the first sample
-        // line up with the moment the drone actually leaves the ground.
+        // Taken after the settle, so the hard time limit and the recording
+        // count from the moment the drone actually leaves the ground.
         flight_start_time = xTaskGetTickCount();
         is_flying = true;
-        // Each flight starts a fresh recording, and the drone never parks
-        // waiting for the app to acknowledge a download. An earlier version did
-        // wait, on a command the app could not send, and silently refused every
-        // mission after the first.
+        // Each takeoff starts a fresh recording, discarding any samples not
+        // yet downloaded. Takeoff never waits for a download.
         sample_count = 0;
         tele_samples = 0;
         last_sample_tick = xTaskGetTickCount();
@@ -1122,27 +939,18 @@ void appMain(void) {
         
         crtpCommanderHighLevelTakeoff(target_height_m, takeoff_duration);
 
-        // The timer is meant to be HOVER time. Counting it from the moment the
-        // climb starts meant a short timer expired mid-climb: a 1s mission
-        // began descending before it ever reached altitude, which looked like
-        // "it never got off the ground". Land only once the climb has finished
-        // AND the requested hover time has elapsed on top of it.
+        // Per-flight resets, so nothing carries over from the previous flight.
         obstacle_streak = 0;
         lowbat_streak = 0;
         tele_maxz = 0;
         tele_endwhy = 0;
         tele_phase = PHASE_CLIMB;
         tele_outwhy = 0;
-        // Whatever way the drone is physically pointing becomes zero. Every
-        // heading in the mission is relative to how it was placed, which is
-        // what a pilot expects and what the estimator assumes.
+        // Headings are relative to the takeoff heading, which the estimator
+        // reset makes 0. meas_yaw is re-read from the estimator next tick.
         mission_yaw = 0.0f;
         meas_yaw = 0.0f;
         waypoint_count = 0;
-        // Every flight starts the follower from scratch. It keeps its state
-        // machine, its heading reference and its corner bookkeeping in statics,
-        // so a second flight on a warm drone would otherwise begin halfway
-        // through the previous one's corner.
         vel_active = false;
         wf_state = CF_FOLLOW;
         vx_cmd = 0.0f;
@@ -1155,30 +963,20 @@ void appMain(void) {
         crumb_x = 0;
         crumb_y = 0;
         if (mission_wallfollow) {
-          // Start ALREADY FOLLOWING, not in `forward`.
-          //
-          // This matters more than it looks. The only way out of the `forward`
-          // state is the FRONT sensor seeing something within 60cm -- it does
-          // not look at the side sensor at all. Bitcraze's demo is launched in
-          // the middle of a room, so it flies forward, meets a wall ahead,
-          // turns to find it and then follows.
-          //
-          // CaveBat is launched with the wall already beside the drone and open
-          // space ahead, which is what the app's own instructions ask for. Told
-          // to start in `forward`, the machine therefore never left it: it flew
-          // straight at full speed past the wall it was supposed to follow
-          // until it hit something. That was three crashed flights.
-          //
-          // `forwardAlongWall` is the state that holds the distance and flies
-          // on, which is exactly the situation on the pad. If the wall turns
-          // out to be further than 70cm the machine drops into findCorner and
-          // searches for it, so a sloppy placement degrades into a search
-          // rather than a crash.
+          // Reset the follower's own statics (step, held heading, corner
+          // bookkeeping), or a second flight on a warm drone would resume the
+          // previous one mid-corner. It starts in CF_FOLLOW, because the drone
+          // is placed with the wall already beside it and open space ahead. If
+          // the wall is further than walldist + 0.4 m, FOLLOW sees the side as
+          // gone and goes to CF_PAST, which handles it as an outward corner:
+          // a short drive on, then a 90-degree turn toward the wall side.
           wallFollowerCornersInit(mission_walldist / 1000.0f, WF_SPEED_MS);
           wf_state = CF_FOLLOW;
         }
         climb_done_tick = xTaskGetTickCount()
                         + M2T((uint32_t)(takeoff_duration * 1000.0f));
+        // Hover time counts from the end of the climb, so a short timer never
+        // expires before the drone reaches altitude.
         hover_deadline = xTaskGetTickCount()
                        + M2T((uint32_t)(takeoff_duration * 1000.0f))
                        + M2T(mission_timer * 1000);
@@ -1187,17 +985,12 @@ void appMain(void) {
         // Peak altitude, so the flight can be judged after the fact.
         if (tele_z > 0 && (uint16_t)tele_z > tele_maxz) tele_maxz = (uint16_t)tele_z;
 
-        // THE BACKSTOP, ABOVE EVERY OTHER RULE.
-        //
-        // The phase machine below decides when the mission is done. If it ever
-        // fails to -- an unfinished trajectory, a wall that confuses the
-        // follower, a bug not yet found -- this brings the drone down anyway.
-        // Nothing else is allowed to keep it airborne past the timer plus a
-        // margin generous enough that a healthy mission never sees it.
-        //
-        // A drone that will not land is the one failure this project cannot
-        // recover from, so it gets a check that does not depend on any of the
-        // logic that might be wrong.
+        // SAFETY: hard time limit, checked before the phases. At timer + 30 s
+        // after takeoff, land whatever the phase machine is doing (a confused
+        // follower, a return that never reaches home, an unknown bug). It
+        // depends on none of the phase logic, because a drone that will not
+        // land is the one failure that cannot be recovered. Normal landings
+        // and this one both report tele.endwhy = 1.
         if ((int32_t)(xTaskGetTickCount() - flight_start_time)
               >= (int32_t)M2T(mission_timer * 1000 + 30000)) {
             if (tele_phase != PHASE_LANDING) {
@@ -1209,9 +1002,9 @@ void appMain(void) {
 
         // --- Mission phases ------------------------------------------------
         //
-        // Nothing here blocks. Every phase does a little work per 10Hz tick and
-        // returns, so recording keeps sampling at 1Hz and the battery and
-        // obstacle guards keep running no matter what the mission is doing.
+        // None of these phases blocks: each does one tick of work and returns,
+        // so the recorder keeps sampling at 1 Hz and the guards keep running.
+        // LANDING, handled after this chain in the same tick, does block.
         if (tele_phase == PHASE_CLIMB) {
             // Wait out the climb before doing anything clever. The estimator is
             // least trustworthy here and the guards are suppressed, so this is
@@ -1221,8 +1014,9 @@ void appMain(void) {
                     tele_phase = PHASE_OUTBOUND;
                     tele_outwhy = 0;
                     waypoint_count = 0;
-                    // Half the timer out, half back. The return is never given
-                    // less time than the outbound leg took.
+                    // Outbound gets half the timer, counted from the end of the
+                    // climb. RETURN has no deadline of its own; the hard time
+                    // limit bounds it.
                     outbound_deadline = xTaskGetTickCount()
                                       + M2T((mission_timer * 1000) / 2);
                     // Where we started, so the trail always ends at the pad.
@@ -1230,8 +1024,8 @@ void appMain(void) {
                     DEBUG_PRINT("CAVEBAT: outbound, following wall on the %s\n",
                                 mission_wallfollow == 2 ? "LEFT" : "RIGHT");
                 } else {
-                    // Wall following off: behave exactly as the previous
-                    // firmware did. Hover until the timer expires.
+                    // Hover mode: OUTBOUND just waits for hover_deadline
+                    // (climb end + timer). No BRAKE or RETURN follows.
                     tele_phase = PHASE_OUTBOUND;
                     tele_outwhy = 0;
                     outbound_deadline = hover_deadline;
@@ -1249,21 +1043,16 @@ void appMain(void) {
             } else {
                 // --- Following a wall ------------------------------------
                 //
-                // No hops and no waiting for a trajectory to finish. The
-                // aircraft is under continuous velocity control, so every tick
-                // simply asks the follower what to do now and does it.
-                //
-                // The reasons to turn for home are checked FIRST, and they are
-                // checked every tick rather than only between hops, so the
-                // geofence now catches a runaway within 100ms instead of
-                // whenever the current hop happened to end. Order matters: the
-                // geofence outranks the clock, because too far is a safety
-                // limit while time is up is only a plan.
+                // Every tick, the reasons to turn for home are checked first,
+                // in priority order: deck silent, geofence, trail full, half
+                // timer. Each one goes to BRAKE, so a runaway is caught within
+                // one tick (~100 ms). The geofence outranks the clock: too far
+                // is a safety limit, time up is only a plan. Otherwise run one
+                // follower tick and drop a breadcrumb if one is due.
                 if (deck_silent_ticks >= DECK_SILENT_LIMIT) {
-                    // The rangers have gone. Wall following is impossible
-                    // without them -- but going HOME is not: the trail is
-                    // breadcrumbs and the Flow deck, neither of which is on the
-                    // failed deck. So stop following and fly the route back.
+                    // All ranges silent (see deck_silent_ticks): following is
+                    // impossible, so stop and fly the breadcrumbs home on the
+                    // position estimate.
                     tele_outwhy = 7;
                     DEBUG_PRINT("CAVEBAT: ranger deck silent 1s, returning\n");
                     tele_phase = PHASE_BRAKE;
@@ -1275,35 +1064,31 @@ void appMain(void) {
                                 (int)tele_x, (int)tele_y);
                     tele_phase = PHASE_BRAKE;
                     brake_start = xTaskGetTickCount();
-                    brake_v0 = vx_cmd;   // ramp down from the REAL speed
+                    brake_v0 = vx_cmd;   // ramp down from the real speed
                 } else if (waypoint_count >= MAX_WAYPOINTS) {
                     tele_outwhy = 4;
                     DEBUG_PRINT("CAVEBAT: breadcrumb trail full, returning\n");
                     tele_phase = PHASE_BRAKE;
                     brake_start = xTaskGetTickCount();
-                    brake_v0 = vx_cmd;   // ramp down from the REAL speed
+                    brake_v0 = vx_cmd;   // ramp down from the real speed
                 } else if ((int32_t)(xTaskGetTickCount() - outbound_deadline) >= 0) {
                     tele_outwhy = 1;
                     DEBUG_PRINT("CAVEBAT: half timer, returning over %d points\n",
                                 (int)waypoint_count);
                     tele_phase = PHASE_BRAKE;
                     brake_start = xTaskGetTickCount();
-                    brake_v0 = vx_cmd;   // ramp down from the REAL speed
+                    brake_v0 = vx_cmd;   // ramp down from the real speed
                 } else {
-                    // Fly the wall. wfTick() reads the sensors, runs Bitcraze's
-                    // state machine and sends the setpoint; the refresh at the
-                    // foot of the loop keeps that setpoint alive at 100Hz.
+                    // Fly the wall. wfTick() is the only place the follower
+                    // runs: it reads the sensors, runs one step of the corners
+                    // follower and sends the setpoint, which the foot of the
+                    // loop re-sends at 100 Hz.
                     vel_active = true;
                     wfTick();
 
-                    // Mark the trail by distance travelled. The return leg
-                    // retraces these, so they have to be close enough together
-                    // that flying straight between two of them cannot cut a
-                    // corner the drone went round.
-                    // 64-bit for the same reason beyondGeofence() is: these are
-                    // millimetres from an estimator that has already been seen
-                    // to report 6401mm in a 500mm hover, and a squared
-                    // difference of two diverged readings passes INT32_MAX.
+                    // Drop a breadcrumb every WF_CRUMB_MM of travel. 64-bit
+                    // for the same reason as beyondGeofence(): the squared
+                    // difference of two diverged readings exceeds INT32_MAX.
                     int64_t dx = (int64_t)tele_x - (int64_t)crumb_x;
                     int64_t dy = (int64_t)tele_y - (int64_t)crumb_y;
                     if (dx * dx + dy * dy
@@ -1311,19 +1096,14 @@ void appMain(void) {
                         dropBreadcrumb();
                     }
 
-                    // One line per second, not per tick.
-                    //
-                    // Three sessions of wall-following crashes were lost
-                    // because nothing recorded what the aircraft was thinking
-                    // in the two seconds before it went over. This is that
-                    // record -- and it is short and slow on purpose, because a
-                    // long line printed ten times a second queues behind
-                    // itself on a 20-byte BLE link and arrives after the crash
-                    // it was meant to explain.
-                    //
-                    // st is the follower's state: 0 forward, 1 hover,
-                    // 2 turnToFindWall, 3 turnToAlignToWall, 4 forwardAlongWall,
-                    // 5 rotateAroundWall, 6 rotateInCorner, 7 findCorner.
+                    // WF console trace, one line every 10 ticks (~1 s). Short
+                    // and slow on purpose: a long line at 10 Hz queues behind
+                    // itself on the 20-byte BLE link and arrives late.
+                    //   st    follower step (CF_* in wallfollowing_corners.h):
+                    //         1 follow, 2 stop, 3 turn, 4 verify, 5 past,
+                    //         6 reacq, 7 gave up, 8 back off
+                    //   f, s  front and followed-side range, mm (0 = none)
+                    //   r, p  roll and pitch, degrees
                     if ((tele_alive % 10) == 0) {
                         DEBUG_PRINT("WF%c st=%d f=%d s=%d r=%d p=%d\n",
                                     (mission_wallfollow == 2) ? 'L' : 'R',
@@ -1340,16 +1120,11 @@ void appMain(void) {
         } else if (tele_phase == PHASE_BRAKE) {
             // --- Slowing down before flying home -------------------------
             //
-            // Ramp the commanded forward speed to zero over BRAKE_MS rather
-            // than dropping it in one tick. A quadrotor stops by pitching up,
-            // which trades away part of the thrust holding it in the air, so an
-            // instant stop demands a hard pitch and costs altitude at the worst
-            // possible moment. That is what put the aircraft on its back.
-            //
-            // Nothing blocks here: the ramp is spread over ordinary 10Hz ticks,
-            // so the recording and the tilt watch keep running right through
-            // the transition. The version this replaces slept 400ms inside the
-            // loop and went blind for exactly the window where it fell.
+            // Ramp forward speed linearly from brake_v0 to zero over BRAKE_MS
+            // (see PHASE_BRAKE), with vy and yaw rate at 0, spread over
+            // ordinary 10 Hz ticks. No obstacle clamp is applied here, and
+            // vx_cmd/vy_cmd are not updated, so RETURN's ramp starts from the
+            // pre-brake command.
             int32_t elapsed = (int32_t)(xTaskGetTickCount() - brake_start);
             if (elapsed < (int32_t)M2T(BRAKE_MS)) {
                 float f = 1.0f - ((float)elapsed / (float)M2T(BRAKE_MS));
@@ -1358,39 +1133,17 @@ void appMain(void) {
                 sendBodyVelocity(brake_v0 * f, 0.0f,
                                  commandedHeight(), 0.0f);
             } else {
-                // Stopped. Hand the aircraft back to the trajectory planner.
-                //
-                // The return leg flies goTo hops, which belong to the
-                // high-level commander -- but the follower has just spent the
-                // whole outbound leg overriding it at a higher priority, and
-                // the planner's idea of where the drone is has been frozen
-                // since takeoff. Handing back without saying so would make the
-                // first hop start from the takeoff pad and fly the difference
-                // as fast as it could.
-                //
-                // commanderRelaxPriority() is the firmware's own answer to
-                // exactly this: it tells the planner the live state estimate
-                // and drops the priority in one go, so the next goTo plans
-                // from where the aircraft actually is.
-                // NO HANDOVER HERE ANY MORE. The return flies on velocity
-                // setpoints, the same as the outbound leg, so the aircraft
-                // stays on the one control path all the way home.
-                //
-                // Two things fall out of that. Everything the outbound leg is
-                // protected by now protects the return as well -- the clamp,
-                // and backing away from anything inside 200mm -- where before
-                // it flew breadcrumb to breadcrumb on the trajectory planner
-                // and no ranger was consulted once. And the handover that used
-                // to happen HERE, mid-flight at half a metre, happens on the
-                // pad instead: the dip it caused cannot recur, rather than
-                // being fixed.
+                // Stopped: start the return at the newest crumb. There is no
+                // handover here. RETURN flies on velocity setpoints like the
+                // outbound leg, so it keeps the obstacle clamp, and control
+                // goes back to the high-level commander only for the landing.
                 return_index = waypoint_count;
                 if (return_index > 0) return_index--;
                 crumb_since = xTaskGetTickCount();
-                // Hold whatever heading the outbound leg ended on. The aircraft
-                // flies home sideways and backwards, which it does perfectly
-                // well, and keeping rotation out of the return is what keeps
-                // the position estimate the breadcrumbs are expressed in.
+                // RETURN holds the current heading (yaw rate 0) and flies
+                // backwards and sideways as needed: not yawing protects the
+                // flow-based position estimate the crumbs are expressed in.
+                // mission_yaw records that heading for reference only.
                 mission_yaw = wrapYaw(safeLogFloat(wf_idYaw) * DEG2RAD);
                 tele_phase = PHASE_RETURN;
                 DEBUG_PRINT("CAVEBAT: stopped, home over %d pts\n",
@@ -1399,24 +1152,17 @@ void appMain(void) {
             }
 
         } else if (tele_phase == PHASE_RETURN) {
-            // THE BREADCRUMBS LEAD, THE RANGERS VETO.
+            // The breadcrumbs lead, the rangers veto. Fly at STEP_SPEED_MS to
+            // waypoints[return_index], then the one before it, down to crumb 0
+            // at the start of the outbound leg. The follower does not run here;
+            // this is a reverse replay of the trail on the position estimate.
             //
-            // The trail is still what decides where to go -- it is dead
-            // reckoning, but it is the aircraft's own dead reckoning over
-            // ground it has just covered, and it brought the last flight home
-            // to within 13cm. Nothing about the navigation changes.
-            //
-            // What changes is that it is flown rather than delegated. Aiming a
-            // velocity at the next crumb instead of handing the planner a goTo
-            // means the command passes through clampAwayFromObstacles on its
-            // way out, and that one line is the difference between a return
-            // leg that can see and one that cannot.
-            //
-            // Avoiding comes free with it. The clamp zeroes only the component
-            // INTO an obstacle, so the component along it survives -- the
-            // aircraft slides down the wall towards the crumb instead of
-            // pressing into it. That is the behaviour wanted, and it is the
-            // behaviour of code already flying.
+            // The command passes through clampAwayFromObstacles, which removes
+            // only the component into an obstacle, so the drone slides along a
+            // wall toward the crumb instead of pressing into it. A crumb not
+            // reached within RETRACE_STUCK_MS is skipped. There is no geofence
+            // or deck-silent check here; the exits are home, the hard time
+            // limit and an abort.
             float tx = waypoints[return_index].x / 1000.0f;
             float ty = waypoints[return_index].y / 1000.0f;
             float dx = tx - (tele_x / 1000.0f);
@@ -1429,9 +1175,8 @@ void appMain(void) {
 
             if (reached || stuck) {
                 if (stuck && !reached) {
-                    // Something is between us and that crumb. Every crumb on
-                    // the trail leads home, so take the next one rather than
-                    // push.
+                    // Something is between the drone and that crumb. Every
+                    // crumb leads home, so take the next one rather than push.
                     DEBUG_PRINT("CAVEBAT: crumb %d blocked, skipping\n",
                                 (int)return_index);
                 }
@@ -1443,18 +1188,19 @@ void appMain(void) {
                     crumb_since = xTaskGetTickCount();
                 }
             } else {
-                // The world-frame direction to the crumb, turned into the body
-                // frame the motors think in. Heading is held throughout, so
-                // this comes out as flying backwards and sideways rather than
-                // as a turn.
+                // The world-frame direction to the crumb, rotated into the body
+                // frame by the measured heading. Heading is held throughout,
+                // so this comes out as flying backwards and sideways rather
+                // than as a turn.
                 float ux = dx / dist, uy = dy / dist;
                 float c = cosf(meas_yaw), sn = sinf(meas_yaw);
                 float vx =  (ux * c + uy * sn) * STEP_SPEED_MS;
                 float vy = (-ux * sn + uy * c) * STEP_SPEED_MS;
 
-                // The whole reason for the rewrite.
+                // Never fly into anything (WF_STOP_MM, WF_PUSH_MM).
                 clampAwayFromObstacles(&vx, &vy);
 
+                // Same WF_ACCEL_MS2 ramp as wfTick().
                 float maxStep = WF_ACCEL_MS2 * 0.1f;
                 float dvx = vx - vx_cmd;
                 float dvy = vy - vy_cmd;
@@ -1471,7 +1217,9 @@ void appMain(void) {
         }
 
         if (tele_phase == PHASE_LANDING) {
-            // Before anything else: a land command is worthless while velocity
+            // Normal landing (timer done, home reached, or hard time limit).
+            // Blocks for the land trajectory plus 0.5 s, then back to IDLE.
+            // Release first: a land command is worthless while velocity
             // setpoints are still being refreshed over the top of it.
             releaseToHighLevel();
             tele_endwhy = 1;
@@ -1490,26 +1238,22 @@ void appMain(void) {
             is_flying = false;
             tele_phase = PHASE_IDLE;
         } else {
-            // High-level commander automatically maintains position (hovers)
-            // after the takeoff trajectory is complete. No explicit API call needed.
-            
-            // Abort if the battery collapses mid-flight. A controlled landing
-            // beats the supervisor cutting the motors at altitude. Skipped
-            // during the climb, where spin-up sag is worst, and requires the
-            // reading to persist so one dip cannot end a flight.
+            // Not landing: run the in-flight aborts. They set
+            // mission.state = 2, and the abort branch below acts on it in the
+            // next tick. (In hover mode the high-level commander holds
+            // position by itself once the takeoff trajectory completes.)
+
+            // In-flight battery abort: vbat under minvbat -
+            // VBAT_INFLIGHT_MARGIN_MV (3100 mV by default) on 3 consecutive
+            // ticks, ignored until the climb is done (spin-up sag is worst
+            // there). A controlled landing beats the supervisor cutting the
+            // motors at altitude.
             //
-            // NOT GATED ON mission.guards ANY MORE, and that gate cost two
-            // aircraft. The parameter defaults to 0, which switched off the
-            // obstacle abort -- sensible, because that one fires on the wall
-            // being followed -- but it switched this off with it. Two flights
-            // then flipped during a turn on a pack resting at 3.80V, which is
-            // exactly the moment of highest current draw and exactly what this
-            // check exists to catch.
-            //
-            // There is no case where flying on a collapsing battery beats
-            // landing on one, so this is no longer a choice. The obstacle abort
-            // below stays optional, because it has a real false-positive mode
-            // and this does not.
+            // SAFETY: deliberately not gated on mission.guards. Flying on a
+            // collapsing battery is never better than landing, and this check
+            // has no false-positive mode that would justify switching it off.
+            // Gating it once left it off by default, and flights then flipped
+            // mid-turn, at peak current draw, on a pack resting at 3.80 V.
             if ((int32_t)(xTaskGetTickCount() - climb_done_tick) < 0) {
                 lowbat_streak = 0;
             } else if (tele_vbat > 0 &&
@@ -1524,19 +1268,17 @@ void appMain(void) {
                 mission_state = 2; // Trigger Abort
             }
 
-            // Abort if an obstacle gets closer than 200mm (0 means no reading)
-            // Only once the climb is done -- see climb_done_tick. Requiring the
-            // obstacle to persist as well: a single stray short reading from a
-            // ToF sensor should not end a flight, but three in a row at 10Hz is
-            // 0.3s, still fast enough to be useful.
+            // In-flight obstacle abort, only with mission.guards = 1 and only
+            // after the climb (see climb_done_tick): something within minobst
+            // (0 = no reading) on 3 consecutive ticks. One stray short ToF
+            // reading should not end a flight; three in a row is 0.3 s.
             if (!mission_guards) {
                 obstacle_streak = 0;
             } else if ((int32_t)(xTaskGetTickCount() - climb_done_tick) < 0) {
                 obstacle_streak = 0;
-            // The sensor pointed at the wall being followed is excluded,
-            // because being close to that wall IS the mission. Left in, this
-            // guard would abort every successful wall follow the moment it
-            // started working. The other three sides still count.
+            // The ranger facing the followed wall is excluded, because being
+            // close to that wall is the mission. Front, back and the other side
+            // still count (all four in hover mode).
             } else if (sideBlocked(tele_front) || sideBlocked(tele_back) ||
                        (mission_wallfollow != 2 && sideBlocked(tele_left)) ||
                        (mission_wallfollow != 1 && sideBlocked(tele_right))) {
@@ -1553,14 +1295,17 @@ void appMain(void) {
         }
         
     } else if (mission_state == 2 && !is_flying) {
-        // Abort pressed while already on the ground. Commanding a landing here
-        // ran a full land trajectory from zero height, spinning the motors for
-        // over a second for no reason. Just clear the request.
+        // Abort while already on the ground: just clear the request. A land
+        // command here would run a full land trajectory from zero height and
+        // spin the motors for over a second for no reason.
         DEBUG_PRINT("CAVEBAT: Abort ignored, not flying\n");
         mission_state = 0;
 
     } else if (mission_state == 2) {
-        // App requested Abort
+        // Abort in flight: requested by the phone (mission.state = 2), or set
+        // by the over-tilt check earlier in this tick, or by the battery or
+        // obstacle check in the previous tick. Lands from wherever the drone
+        // is (no BRAKE, no RETURN) with tele.endwhy = 2; blocks like LANDING.
         releaseToHighLevel();   // or the land below is overridden, see above
         tele_endwhy = 2;
         tele_phase = PHASE_LANDING;
@@ -1580,15 +1325,13 @@ void appMain(void) {
     }
 
     if (!is_flying && mission_state == 0) {
-       // Reset flight flag if landed
-       is_flying = false; 
+       // Redundant: is_flying is already false whenever this runs.
+       is_flying = false;
     }
 
-    // Every 10s, not every 1s. The loop runs at 10Hz, so "% 10" printed a
-    // ~60-char status line every second. Over BLE that saturates the link and
-    // queues real replies (param/log TOC) behind console text until the app
-    // times out waiting for them. This is a heartbeat, not telemetry - the
-    // app reads tele.* directly.
+    // Heartbeat console line every 100 ticks (~10 s). Printing it every
+    // second saturates the BLE link and queues param/log TOC replies behind
+    // console text until the app times out. Live values come from tele.*.
     if ((tele_alive % 100) == 0) {
       DEBUG_PRINT("CB state=%d bat=%d f=%d b=%d l=%d r=%d u=%d d=%d\n",
                   (int)mission_state, (int)tele_vbat, (int)tele_front,
@@ -1596,19 +1339,15 @@ void appMain(void) {
                   (int)tele_up, (int)tele_down);
     }
     
-    // The loop stays at 10Hz. Everything above is tuned for it: the guards
-    // count ticks, the heartbeat divides by it, and the app expects telemetry
-    // at this rate.
+    // The loop decides at 10 Hz (a little slower in practice: the work above
+    // adds to the 100 ms). Everything above is tuned for that: the guards
+    // count ticks and the heartbeat and trace divide by it.
     //
-    // But a velocity setpoint cannot be left to age for 100ms -- the aircraft
-    // goes on obeying the last one it was given, so at 10Hz it would fly each
-    // command in 10cm lurches. So the delay is spent in ten 10ms slices and the
-    // setpoint is re-sent on each, which is the 100Hz Bitcraze's follower was
-    // proven at. commanderSetSetpoint() re-stamps the timestamp, so re-sending
-    // the same struct is exactly what keeps it alive.
-    //
-    // While not wall following this is one unchanged 100ms delay, so the hover
-    // path behaves precisely as it did before.
+    // While vel_active, the wait is spent in ten 10 ms slices and the velocity
+    // setpoint is re-sent on each, a 100 Hz refresh. commanderSetSetpoint()
+    // re-stamps the timestamp, so re-sending the same struct keeps the command
+    // fresh for the commander and the supervisor. Otherwise (hover mode, on
+    // the ground) this is a plain 100 ms wait.
     for (uint8_t i = 0; i < 10; i++) {
       vTaskDelay(M2T(10));
       if (vel_active) {
@@ -1619,6 +1358,8 @@ void appMain(void) {
 }
 
 // --- Parameter Registration ---
+// tele.*: status values, also in the log group below (phase, outwhy and yaw
+// are log-only). mission.*: the mission settings, described at the top.
 PARAM_GROUP_START(tele)
   PARAM_ADD(PARAM_UINT16, alive, &tele_alive)
   PARAM_ADD(PARAM_UINT8,  canfly, &tele_canfly)
@@ -1626,11 +1367,10 @@ PARAM_GROUP_START(tele)
   PARAM_ADD(PARAM_UINT16, maxz,   &tele_maxz)
   PARAM_ADD(PARAM_UINT16, samples, &tele_samples)
   PARAM_ADD(PARAM_UINT8,  endwhy, &tele_endwhy)
-  // NOT exposed: tele_wfstate. The follower's state goes out in the WF trace
-  // line instead. Adding a parameter changes the parameter table, which
-  // invalidates the app's cached copy and needs KNOWN_PARAM_NAMES updated to
-  // match -- a mismatch there already cost one flight. The console line
-  // carries the same information at no such cost.
+  // tele_wfstate is deliberately not exposed (as a param or a log). Adding a
+  // param changes the param table, which invalidates the app's cached copy and
+  // requires the app's KNOWN_PARAM_NAMES to be updated to match. The follower
+  // step goes out in the WF console line and in the recording instead.
   PARAM_ADD(PARAM_UINT16, vbat,  &tele_vbat)
   PARAM_ADD(PARAM_UINT16, front, &tele_front)
   PARAM_ADD(PARAM_UINT16, back,  &tele_back)
@@ -1651,10 +1391,10 @@ PARAM_GROUP_START(mission)
   PARAM_ADD(PARAM_UINT32, minvbat,    &mission_minvbat)
   PARAM_ADD(PARAM_UINT32, minobst,    &mission_minobst)
   PARAM_ADD(PARAM_UINT8,  guards,     &mission_guards)
-  // 0 = hover out the timer exactly as the previous firmware did.
+  // 0 = hover for the timer, then land.
   // 1 = follow a wall on the RIGHT for half the timer, then retrace home.
   // 2 = the same, following a wall on the LEFT.
-  // Defaults to 0 so flashing this cannot regress a drone that already flies.
+  // Defaults to 0, plain hover, if the app never sets it.
   PARAM_ADD(PARAM_UINT8,  wallfollow, &mission_wallfollow)
   PARAM_ADD(PARAM_UINT32, walldist,   &mission_walldist)
 PARAM_GROUP_STOP(mission)
@@ -1668,10 +1408,10 @@ LOG_GROUP_START(tele)
   LOG_ADD(LOG_UINT16, samples, &tele_samples)
   LOG_ADD(LOG_UINT8,  endwhy, &tele_endwhy)
   // What the drone is doing right now, so the app can say so:
-  // 0 idle, 1 climbing, 2 outbound, 3 returning, 4 landing.
+  // 0 idle, 1 climbing, 2 outbound, 3 returning, 4 landing, 5 braking.
   LOG_ADD(LOG_UINT8,  phase,  &tele_phase)
-  // Why the outbound leg ended:
-  // 0 still going, 1 half the timer, 2 geofence, 3 blocked, 4 trail full.
+  // Why the outbound leg ended: 0 still going, 1 timer, 2 geofence,
+  // 4 trail full, 7 ranger deck silent (3 is not set by this build).
   LOG_ADD(LOG_UINT8,  outwhy, &tele_outwhy)
   LOG_ADD(LOG_INT16,  yaw,    &tele_yaw)
   LOG_ADD(LOG_UINT16, vbat,  &tele_vbat)
